@@ -34,6 +34,9 @@ assert LooseVersion(keras.__version__) >= LooseVersion('2.0.8')
 #  Utility Functions
 ############################################################
 
+BATCH_SIZE = None
+ROIS = None
+
 
 def gauss(x):
     return tf.exp(-1 * x * x)
@@ -800,6 +803,29 @@ class DetectionTargetLayer(KE.Layer):
         return [None, None, None, None]
 
 
+def calculate_lstm_features(x):
+    o = KL.LSTM(128)(x)
+    return o
+
+
+class LSTMLayer(KE.Layer):
+    def __init__(self, config=None, **kwargs):
+        super(LSTMLayer, self).__init__(**kwargs)
+        self.config = config
+
+    def call(self, input):
+        self.dim = input.shape[1]
+
+        output = utils.batch_slice([input],
+                                   lambda x: calculate_lstm_features(x),
+                                   self.config.IMAGES_PER_GPU)
+
+        return output
+
+    def compute_output_shape(self, input_shape):
+        return [(None, input_shape[1], 128)]
+
+
 ############################################################
 # Structure Detection Layer
 ############################################################
@@ -939,6 +965,7 @@ def refine_structure_detections_graph(image_features,
         false_fn=lambda: tf.cast(tf.constant([]), tf.int64))
     positive_preds = tf.gather(detected_regions, positive_indices)
     roi_gt_boxes = tf.gather(gt_boxes, roi_gt_box_assignment)
+    num_detected_boxes = tf.shape(positive_preds)[0]
 
     roi_gt_start_rows = tf.gather(gt_start_rows, roi_gt_box_assignment)
     roi_gt_start_cols = tf.gather(gt_start_cols, roi_gt_box_assignment)
@@ -1007,6 +1034,8 @@ def refine_structure_detections_graph(image_features,
     roi_gt_boxes = tf.concat([gt_y1, gt_x1, gt_y2, gt_x2], 1)
     pred_boxes_denorm = denorm_boxes_graph(positive_preds, [256, 256])
     pred_boxes_denorm = tf.cast(pred_boxes_denorm, tf.float32)
+    gt_boxes_denorm = denorm_boxes_graph(roi_gt_boxes, [256, 256])
+    gt_boxes_denorm = tf.cast(gt_boxes_denorm, tf.float32)
     vertices_y, vertices_x, vertices_y2, vertices_x2 = tf.split(
         pred_boxes_denorm, 4, axis=1)
     vertices_y = tf.squeeze(vertices_y)
@@ -1035,48 +1064,50 @@ def refine_structure_detections_graph(image_features,
     gathered_y_mid = tf.gather_nd(conv_head_y, indexing_tensor_y_mid)
 
     #indexing_tensor = tf.reshape(indexing_tensor, [-1, 3])
-    vertex_features = tf.gather_nd(image_features, indexing_tensor)
-    conv_width = tf.shape(image_features)[1]
-    conv_depth = tf.shape(image_features)[-1]
-    conv_range = tf.range(0, conv_width, dtype=tf.int32)
-    mask_gt_y1 = tf.math.greater_equal(conv_range, vertices_y[:, tf.newaxis])
-    print("mask_gt_y1 : ######" + str(mask_gt_y1.shape) + " ######")
-    mask_lt_y2 = tf.math.less_equal(conv_range, vertices_y2[:, tf.newaxis])
-    print("mask_lt_y2 : ######" + str(mask_lt_y2.shape) + " ######")
-    mask_y_mid = tf.math.logical_and(mask_gt_y1, mask_lt_y2)
-    mask_y_mid = tf.tile(tf.expand_dims(mask_y_mid, -1), [1, 1, conv_depth])
+    # vertex_features = tf.gather_nd(image_features, indexing_tensor)
+    # conv_width = tf.shape(image_features)[1]
+    # conv_depth = tf.shape(image_features)[-1]
+    # conv_range = tf.range(0, conv_width, dtype=tf.int32)
+    # mask_gt_y1 = tf.math.greater_equal(conv_range, vertices_y[:, tf.newaxis])
+    # # print("mask_gt_y1 : ######" + str(mask_gt_y1.shape) + " ######")
+    # mask_lt_y2 = tf.math.less_equal(conv_range, vertices_y2[:, tf.newaxis])
+    # # print("mask_lt_y2 : ######" + str(mask_lt_y2.shape) + " ######")
+    # mask_y_mid = tf.math.logical_and(mask_gt_y1, mask_lt_y2)
+    # mask_y_mid = tf.tile(tf.expand_dims(mask_y_mid, -1), [1, 1, conv_depth])
 
-    mask_gt_x1 = tf.math.greater_equal(conv_range, vertices_x[:, tf.newaxis])
-    print("mask_gt_y1 : ######" + str(mask_gt_x1.shape) + " ######")
-    mask_lt_x2 = tf.math.less_equal(conv_range, vertices_x2[:, tf.newaxis])
-    print("mask_lt_y2 : ######" + str(mask_lt_x2.shape) + " ######")
-    mask_x_mid = tf.math.logical_and(mask_gt_x1, mask_lt_x2)
-    mask_x_mid = tf.tile(tf.expand_dims(mask_x_mid, -1), [1, 1, conv_depth])
-    print("Here.....")
-    print(conv_width)
-    print(conv_depth)
-    gathered_values_x_mid = tf.where(
-        mask_x_mid, gathered_x_mid,
-        tf.zeros([tf.shape(positive_preds)[0], conv_width, conv_depth],
-                 dtype=tf.float32))
+    # mask_gt_x1 = tf.math.greater_equal(conv_range, vertices_x[:, tf.newaxis])
+    # # print("mask_gt_y1 : ######" + str(mask_gt_x1.shape) + " ######")
+    # mask_lt_x2 = tf.math.less_equal(conv_range, vertices_x2[:, tf.newaxis])
+    # # print("mask_lt_y2 : ######" + str(mask_lt_x2.shape) + " ######")
+    # mask_x_mid = tf.math.logical_and(mask_gt_x1, mask_lt_x2)
+    # mask_x_mid = tf.tile(tf.expand_dims(mask_x_mid, -1), [1, 1, conv_depth])
+    # # print("Here.....")
+    # # print(conv_width)
+    # # print(conv_depth)
+    # gathered_values_x_mid = tf.where(
+    #     mask_x_mid, gathered_x_mid,
+    #     tf.zeros([tf.shape(positive_preds)[0], conv_width, conv_depth],
+    #              dtype=tf.float32))
 
-    gathered_values_y_mid = tf.where(
-        mask_y_mid, gathered_y_mid,
-        tf.zeros([tf.shape(positive_preds)[0], conv_width, conv_depth],
-                 dtype=tf.float32))
+    # gathered_values_y_mid = tf.where(
+    #     mask_y_mid, gathered_y_mid,
+    #     tf.zeros([tf.shape(positive_preds)[0], conv_width, conv_depth],
+    #              dtype=tf.float32))
 
-    lstm_x_output = KL.LSTM(128)(gathered_values_x_mid)
-    lstm_y_output = KL.LSTM(128)(gathered_values_x_mid)
-    vertex_features = tf.concat((lstm_x_output, lstm_y_output), -1)
+    # gathered_values_x_mid = tf.cond(
+    #     tf.equal(tf.shape(gathered_values_x_mid)[0], tf.constant(0)),
+    #     lambda: tf.cast(tf.zeros(shape=(1, 256, 256)), tf.float32),
+    #     lambda: tf.cast(gathered_values_x_mid, tf.float32))
+    # gathered_values_y_mid = tf.cond(
+    #     tf.equal(tf.shape(gathered_values_y_mid)[0], tf.constant(0)),
+    #     lambda: tf.cast(tf.zeros(shape=(1, 256, 256)), tf.float32),
+    #     lambda: tf.cast(gathered_values_y_mid, tf.float32))
 
-    vertex_features = tf.reshape(vertex_features,
-                                 [-1, config.TOP_DOWN_PYRAMID_SIZE])
-
-    lstm_input_x = gathered_values_x_mid
-    lstm_input_y = gathered_values_y_mid
-    print("%%%%%" + str(vertex_features.shape) + "#######")
-    print("%%%%%" + str(vertex_features.shape) + "#######")
-
+    # vertex_features = tf.cond(
+    #     tf.greater(num_detected_boxes, tf.constant(0)),
+    #     lambda: tf.gather_nd(image_features, indexing_tensor),
+    #     lambda: tf.cast(concatenated_lstm_output, tf.float32))
+    # vertex_features = tf.gather_nd(image_features, indexing_tensor)
     stuct_info = tf.concat([
         tf.expand_dims(roi_gt_start_rows, -1),
         tf.expand_dims(roi_gt_start_cols, -1),
@@ -1087,11 +1118,16 @@ def refine_structure_detections_graph(image_features,
                    0)
     pred_boxes = tf.pad(positive_preds, [(0, P), (0, 0)])
     roi_gt_boxes = tf.pad(roi_gt_boxes, [(0, P), (0, 0)])
+    gt_boxes_denorm = tf.pad(gt_boxes_denorm, [(0, P), (0, 0)])
     stuct_info = tf.pad(stuct_info, [(0, P), (0, 0)])
     adj_rows = tf.pad(adj_rows, [(0, P), (0, P)])
     adj_cols = tf.pad(adj_cols, [(0, P), (0, P)])
-    vertex_features = tf.pad(vertex_features, [(0, P), (0, 0)])
+    #vertex_features = tf.pad(vertex_features, [(0, P), (0, 0)])
+    # concatenated_lstm_output = tf.pad(concatenated_lstm_output, [(0, P),
+    #                                                              (0, 0)])
     pred_boxes_denorm = tf.pad(pred_boxes_denorm, [(0, P), (0, 0)])
+    gathered_x_mid = tf.pad(gathered_x_mid, [(0, P), (0, 0), (0, 0)])
+    gathered_y_mid = tf.pad(gathered_y_mid, [(0, P), (0, 0), (0, 0)])
 
     print("Graph vertices collection....")
     print("Image features..." + str(image_features.shape))
@@ -1102,7 +1138,7 @@ def refine_structure_detections_graph(image_features,
     #print(stuct_info.shape)
     #print(roi_gt_boxes.shape)
 
-    return pred_boxes, pred_boxes_denorm, roi_gt_boxes, stuct_info, adj_rows, adj_cols, vertex_features
+    return num_detected_boxes, pred_boxes, gt_boxes_denorm, pred_boxes_denorm, roi_gt_boxes, stuct_info, adj_rows, adj_cols, gathered_x_mid, gathered_y_mid
 
 
 class StructureDetectionLayer(KE.Layer):
@@ -1155,7 +1191,8 @@ class StructureDetectionLayer(KE.Layer):
         return detections_batch
 
     def compute_output_shape(self, input_shape):
-        return [(None, self.config.TRAIN_ROIS_PER_IMAGE, 4),
+        return [(None), (None, self.config.TRAIN_ROIS_PER_IMAGE, 4),
+                (None, self.config.TRAIN_ROIS_PER_IMAGE, 4),
                 (None, self.config.TRAIN_ROIS_PER_IMAGE, 4),
                 (None, self.config.TRAIN_ROIS_PER_IMAGE, 4),
                 (None, self.config.TRAIN_ROIS_PER_IMAGE, 4),
@@ -1163,7 +1200,9 @@ class StructureDetectionLayer(KE.Layer):
                  self.config.TRAIN_ROIS_PER_IMAGE),
                 (None, self.config.TRAIN_ROIS_PER_IMAGE,
                  self.config.TRAIN_ROIS_PER_IMAGE),
-                (None, self.config.TRAIN_ROIS_PER_IMAGE,
+                (None, self.config.TRAIN_ROIS_PER_IMAGE, 256,
+                 self.config.TOP_DOWN_PYRAMID_SIZE),
+                (None, self.config.TRAIN_ROIS_PER_IMAGE, 256,
                  self.config.TOP_DOWN_PYRAMID_SIZE)]
 
 
@@ -1616,17 +1655,33 @@ def refine_detections_graph(rois, probs, deltas, window, image_features,
     vertices_x2 = tf.squeeze(vertices_x2)
     vertices_x_mid = (vertices_x + vertices_x2) / 2
     vertices_y_mid = (vertices_y + vertices_y2) / 2
+    vertices_y = tf.cast(vertices_y, tf.int32)
+    vertices_x = tf.cast(vertices_x, tf.int32)
+    vertices_y2 = tf.cast(vertices_y2, tf.int32)
+    vertices_x2 = tf.cast(vertices_x2, tf.int32)
+    vertices_x_mid = tf.cast(vertices_x_mid, tf.int32)
+    vertices_y_mid = tf.cast(vertices_y_mid, tf.int32)
     vertices_x_mid = tf.reshape(vertices_x_mid,
                                 [tf.shape(pred_boxes_denorm)[0], 1])
     vertices_y_mid = tf.reshape(vertices_y_mid,
                                 [tf.shape(pred_boxes_denorm)[0], 1])
-    indexing_tensor = tf.concat(
-        (vertices_y_mid[..., tf.newaxis], vertices_x_mid[..., tf.newaxis]),
-        axis=-1)
+    #vertices_range = tf.range(0, tf.shape(pred_boxes_denorm)[0])[..., tf.newaxis]
+    #vertices_range = tf.cast(vertices_range, tf.float32)
+    conv_head_y = image_features
+    conv_head_x = K.permute_dimensions(image_features, [1, 0, 2])
+    indexing_tensor = tf.concat((vertices_y_mid, vertices_x_mid), axis=-1)
     indexing_tensor = tf.cast(indexing_tensor, tf.int32)
-    vertex_features = tf.gather_nd(image_features, indexing_tensor)
-    vertex_features = tf.reshape(vertex_features,
-                                 [-1, config.TOP_DOWN_PYRAMID_SIZE])
+    indexing_tensor_x_mid = tf.cast(vertices_x_mid, tf.int32)
+    indexing_tensor_y_mid = tf.cast(vertices_y_mid, tf.int32)
+    gathered_x_mid = tf.gather_nd(conv_head_x, indexing_tensor_x_mid)
+    gathered_y_mid = tf.gather_nd(conv_head_y, indexing_tensor_y_mid)
+    # indexing_tensor = tf.concat(
+    #     (vertices_y_mid[..., tf.newaxis], vertices_x_mid[..., tf.newaxis]),
+    #     axis=-1)
+    # indexing_tensor = tf.cast(indexing_tensor, tf.int32)
+    # vertex_features = tf.gather_nd(image_features, indexing_tensor)
+    # vertex_features = tf.reshape(vertex_features,
+    #                              [-1, config.TOP_DOWN_PYRAMID_SIZE])
     #pred_boxes_denorm = tf.cast(pred_boxes_denorm, tf.float32)
     detections = tf.concat([
         tf.gather(refined_rois, keep),
@@ -1640,9 +1695,10 @@ def refine_detections_graph(rois, probs, deltas, window, image_features,
     detections = tf.pad(detections, [(0, gap), (0, 0)], "CONSTANT")
     pred_boxes_denorm = tf.pad(pred_boxes_denorm, [(0, gap), (0, 0)])
     pred_boxes_denorm = tf.cast(pred_boxes_denorm, tf.float32)
-    vertex_features = tf.pad(vertex_features, [(0, gap), (0, 0)])
+    gathered_x_mid = tf.pad(gathered_x_mid, [(0, gap), (0, 0), (0, 0)])
+    gathered_y_mid = tf.pad(gathered_y_mid, [(0, gap), (0, 0), (0, 0)])
 
-    return detections, pred_boxes_denorm, vertex_features
+    return detections, pred_boxes_denorm, gathered_x_mid, gathered_y_mid
 
 
 class DetectionLayer(KE.Layer):
@@ -1693,7 +1749,9 @@ class DetectionLayer(KE.Layer):
     def compute_output_shape(self, input_shape):
         return [(None, self.config.DETECTION_MAX_INSTANCES, 6),
                 (None, self.config.DETECTION_MAX_INSTANCES, 4),
-                (None, self.config.DETECTION_MAX_INSTANCES,
+                (None, self.config.DETECTION_MAX_INSTANCES, 256,
+                 self.config.TOP_DOWN_PYRAMID_SIZE),
+                (None, self.config.DETECTION_MAX_INSTANCES, 256,
                  self.config.TOP_DOWN_PYRAMID_SIZE)]
 
 
@@ -1919,7 +1977,7 @@ def smooth_l1_loss(y_true, y_pred):
     return loss
 
 
-def adjacency_loss(y_true, y_pred):
+def adjacency_loss_old(y_true, y_pred, num_detected_boxes):
     """Implements Smooth-L1 loss.
     y_true and y_pred are typically: [N, 4], but could be any shape.
     """
@@ -1936,6 +1994,41 @@ def adjacency_loss(y_true, y_pred):
                                                     targets=tf.one_hot(
                                                         y_true, depth=2),
                                                     pos_weight=pos_weight)
+    loss = tf.reduce_mean(loss)
+    return loss
+
+
+def adjacency_loss(y_true, y_pred, num_detected_boxes):
+    """Implements Smooth-L1 loss.
+    y_true and y_pred are typically: [N, 4], but could be any shape.
+    """
+    print("**********************")
+    print(y_true.shape)
+    print(y_pred.shape)
+    mask = tf.sequence_mask(num_detected_boxes, ROIS)
+    mask = tf.cast(mask, tf.float32)
+    mask_pairwise = tf.expand_dims(mask, 1) * tf.expand_dims(mask, 2)
+    mask_pairwise_tiled = tf.tile(tf.expand_dims(mask_pairwise, -1),
+                                  [1, 1, 1, 2])
+    y_true = tf.cast(y_true, tf.float32)
+    mask_pairwise = tf.cast(mask_pairwise, tf.float32)
+    mask_pairwise_tiled = tf.cast(mask_pairwise_tiled, tf.float32)
+    total_count = tf.cast(tf.math.count_nonzero(mask), tf.float32)
+    count_ones = tf.cast(tf.math.count_nonzero(y_true * mask_pairwise),
+                         tf.float32) + tf.constant([0.001], tf.float32)
+    count_zeros = total_count - count_ones
+    pos_weight = tf.math.divide(count_zeros, count_ones)
+    y_true = tf.cast(y_true, tf.int32)
+    #loss = tf.nn.softmax_cross_entropy_with_logits_v2(labels=tf.one_hot(y_true, depth=2), logits=y_pred)
+    loss = tf.nn.weighted_cross_entropy_with_logits(
+        logits=y_pred,
+        targets=tf.one_hot(y_true, depth=2),
+        pos_weight=pos_weight) * mask_pairwise_tiled
+    print(loss.shape)
+    loss = tf.reduce_mean(loss, axis=-1)
+    loss = tf.reduce_sum(loss,
+                         axis=-1) / (tf.cast(num_detected_boxes, tf.float32) +
+                                     tf.constant(0.00000001, dtype=tf.float32))
     loss = tf.reduce_mean(loss)
     return loss
 
@@ -1965,8 +2058,8 @@ def rpn_class_loss_graph(rpn_match, rpn_class_logits):
     return loss
 
 
-def rpn_bbox_structural_loss_graph(roi_box_coordinate, roi_gt_coordinate,
-                                   segments):
+def rpn_bbox_structural_loss_graph_old(roi_box_coordinate, roi_gt_coordinate,
+                                       segments, num_detected_boxes):
     #tf.InteractiveSession()
     segments = tf.cast(segments, tf.float32)
     roi_box_pairwise_diff = tf.expand_dims(
@@ -2001,6 +2094,34 @@ def rpn_bbox_structural_loss_graph(roi_box_coordinate, roi_gt_coordinate,
     #return pairwise_equal_segments
     #return tf.square((roi_gt_box_pairwise_diff * pairwise_equal_segments))
     return total_loss
+
+
+def rpn_bbox_structural_loss_graph(roi_box_coordinate, roi_gt_coordinate,
+                                   segments, num_detected_boxes):
+
+    mask = tf.sequence_mask(num_detected_boxes, ROIS)
+    mask = tf.cast(mask, tf.float32)
+    mask_pairwise = tf.expand_dims(mask, 1) * tf.expand_dims(mask, 2)
+    mask_pairwise = tf.tile(tf.expand_dims(mask_pairwise, -1), [1, 1, 1, 4])
+    segments = tf.cast(segments, tf.float32)
+    roi_box_pairwise_diff = tf.expand_dims(
+        roi_box_coordinate, 1) - tf.expand_dims(roi_box_coordinate, 2)
+    roi_gt_box_pairwise_diff = tf.expand_dims(
+        roi_gt_coordinate, 1) - tf.expand_dims(roi_gt_coordinate, 2)
+    pairwise_equal_segments = tf.equal(tf.expand_dims(segments, 1),
+                                       tf.expand_dims(segments, 2))
+    pairwise_equal_segments = tf.cast(pairwise_equal_segments, tf.float32)
+    roi_gt_box_pairwise_diff = roi_gt_box_pairwise_diff * pairwise_equal_segments
+    roi_box_pairwise_diff = roi_box_pairwise_diff * pairwise_equal_segments
+    #print(roi_gt_box_pairwise_diff.shape)
+    #print(pairwise_equal_segments.eval())
+    loss = tf.compat.v1.losses.mean_squared_error(
+        roi_gt_box_pairwise_diff, roi_box_pairwise_diff) * mask_pairwise
+    loss = tf.cast(tf.reduce_sum(loss, [1, 2, 3]),
+                   tf.float32) / (tf.cast(num_detected_boxes, tf.float32) +
+                                  tf.constant(0.00000001, dtype=tf.float32))
+    loss = tf.reduce_mean(loss)
+    return loss
 
 
 def rpn_bbox_loss_graph(config, target_bbox, rpn_match, rpn_bbox):
@@ -3446,13 +3567,18 @@ class MaskRCNN():
                                               config.NUM_CLASSES,
                                               train_bn=config.TRAIN_BN)
 
-            detection_boxes, detection_boxes_denorm, roi_gt_boxes, stuct_info, adj_rows, adj_cols, vertex_features = StructureDetectionLayer(
+            num_detected_boxes, detection_boxes, gt_boxes_denorm, detection_boxes_denorm, roi_gt_boxes, stuct_info, adj_rows, adj_cols, gathered_x_mid, gathered_y_mid = StructureDetectionLayer(
                 config, name="mrcnn_detection")([
                     rois, mrcnn_class, mrcnn_bbox, input_image_meta,
                     input_gt_class_ids, gt_boxes, input_gt_start_rows,
                     input_gt_start_cols, input_gt_end_rows, input_gt_end_cols,
                     P2
                 ])
+            lstm_x_output = LSTMLayer(config, name="lstm_x")(gathered_x_mid)
+            lstm_y_output = LSTMLayer(config, name="lstm_y")(gathered_y_mid)
+            concatenated_lstm_output = KL.concatenate(
+                [lstm_x_output, lstm_y_output])
+            vertex_features = concatenated_lstm_output
             vertex_features = KL.concatenate(
                 [vertex_features, detection_boxes_denorm])
             aggregate_vertex_features_row = prepare_graph_features_row(
@@ -3515,16 +3641,25 @@ class MaskRCNN():
                                   name="mrcnn_mask_loss")([
                                       target_mask, target_class_ids, mrcnn_mask
                                   ])
+
+            global ROIS
+            ROIS = config.TRAIN_ROIS_PER_IMAGE
             roi_alignment_loss = KL.Lambda(
                 lambda x: rpn_bbox_structural_loss_graph(*x),
-                name="roi_alignment_loss")(
-                    [detection_boxes, roi_gt_boxes, stuct_info])
+                name="roi_alignment_loss")([
+                    detection_boxes_denorm, gt_boxes_denorm, stuct_info,
+                    num_detected_boxes
+                ])
             row_adj_loss = KL.Lambda(lambda x: adjacency_loss(*x),
-                                     name="row_adj_loss")(
-                                         [adj_rows, row_adj_logits])
+                                     name="row_adj_loss")([
+                                         adj_rows, row_adj_logits,
+                                         num_detected_boxes
+                                     ])
             col_adj_loss = KL.Lambda(lambda x: adjacency_loss(*x),
-                                     name="col_adj_loss")(
-                                         [adj_cols, col_adj_logits])
+                                     name="col_adj_loss")([
+                                         adj_cols, col_adj_logits,
+                                         num_detected_boxes
+                                     ])
 
             # Model
             inputs = [
@@ -3538,9 +3673,10 @@ class MaskRCNN():
             outputs = [
                 rpn_class_logits, rpn_class, rpn_bbox, mrcnn_class_logits,
                 mrcnn_class, mrcnn_bbox, mrcnn_mask, rpn_rois, output_rois,
-                detection_boxes, rpn_class_loss, rpn_bbox_loss, class_loss,
-                bbox_loss, mask_loss, roi_alignment_loss, row_adj_logits,
-                col_adj_logits, row_adj_loss, col_adj_loss
+                gt_boxes_denorm, detection_boxes_denorm, rpn_class_loss,
+                rpn_bbox_loss, class_loss, bbox_loss, mask_loss,
+                roi_alignment_loss, row_adj_logits, col_adj_logits,
+                row_adj_loss, col_adj_loss, concatenated_lstm_output
             ]
             model = KM.Model(inputs, outputs, name='mask_rcnn')
         else:
@@ -3555,9 +3691,14 @@ class MaskRCNN():
             # Detections
             # output is [batch, num_detections, (y1, x1, y2, x2, class_id, score)] in
             # normalized coordinates
-            detections, pred_boxes_denorm, vertex_features = DetectionLayer(
+            detections, pred_boxes_denorm, gathered_x_mid, gathered_y_mid = DetectionLayer(
                 config, name="mrcnn_detection")(
                     [rpn_rois, mrcnn_class, mrcnn_bbox, input_image_meta, P2])
+            lstm_x_output = LSTMLayer(config, name="lstm_x")(gathered_x_mid)
+            lstm_y_output = LSTMLayer(config, name="lstm_y")(gathered_y_mid)
+            concatenated_lstm_output = KL.concatenate(
+                [lstm_x_output, lstm_y_output])
+            vertex_features = concatenated_lstm_output
             vertex_features = KL.concatenate(
                 [vertex_features, pred_boxes_denorm], axis=-1)
 
@@ -3594,7 +3735,7 @@ class MaskRCNN():
                 x, (0, 2, 1, 3)))(graph_features_col)
             graph_features_col = KL.Lambda(
                 lambda x: KL.concatenate([x[0], x[1]]))(
-                    [graph_features_row, graph_features_t_col])
+                    [graph_features_col, graph_features_t_col])
             #graph_features = KL.concatenate([K.tile(K.expand_dims(aggregate_vertex_features, 1), [1, config.TRAIN_ROIS_PER_IMAGE, 1, 1]), K.tile(K.expand_dims(aggregate_vertex_features, 2), [1, 1, config.TRAIN_ROIS_PER_IMAGE, 1])])
             row_adj_logits = build_row_adj_classifier(graph_features_row)
             col_adj_logits = build_col_adj_classifier(graph_features_col)
@@ -3897,11 +4038,11 @@ class MaskRCNN():
             r"(mrcnn\_.*)|(rpn\_.*)|(fpn\_.*)|(gate\_.*)|(graph\_.*)|(row\_.*)|(col\_.*)",
             # From a specific Resnet stage and up
             "3+":
-            r"(res3.*)|(bn3.*)|(res4.*)|(bn4.*)|(res5.*)|(bn5.*)|(mrcnn\_.*)|(rpn\_.*)|(fpn\_.*)(td\_.*)|(bu\_.*)|(gate\_.*)|(graph\_.*)|(row\_.*)|(col\_.*)",
+            r"(res3.*)|(bn3.*)|(res4.*)|(bn4.*)|(res5.*)|(bn5.*)|(mrcnn\_.*)|(rpn\_.*)|(fpn\_.*)(td\_.*)|(bu\_.*)|(gate\_.*)|(graph\_.*)|(row\_.*)|(col\_.*)|(lstm\_.*)",
             "4+":
-            r"(res4.*)|(bn4.*)|(res5.*)|(bn5.*)|(mrcnn\_.*)|(rpn\_.*)|(fpn\_.*)(td\_.*)|(bu\_.*)|(gate\_.*)|(graph\_.*)|(row\_.*)|(col\_.*)",
+            r"(res4.*)|(bn4.*)|(res5.*)|(bn5.*)|(mrcnn\_.*)|(rpn\_.*)|(fpn\_.*)(td\_.*)|(bu\_.*)|(gate\_.*)|(graph\_.*)|(row\_.*)|(col\_.*)|(lstm\_.*)",
             "5+":
-            r"(res5.*)|(bn5.*)|(mrcnn\_.*)|(rpn\_.*)|(fpn\_.*)(td\_.*)|(bu\_.*)|(gate\_.*)|(graph\_.*)|(row\_.*)|(col\_.*)",
+            r"(res5.*)|(bn5.*)|(mrcnn\_.*)|(rpn\_.*)|(fpn\_.*)(td\_.*)|(bu\_.*)|(gate\_.*)|(graph\_.*)|(row\_.*)|(col\_.*)|(lstm\_.*)",
             # All layers
             "all": ".*",
         }

@@ -1,0 +1,2 @@
+Please add the models (mask_rcnn_tab_.h5) files into this folder.
+Link to download: https://drive.google.com/drive/folders/1DRFbOW5FSl4A73wgw5i9O0JKkRegyO6-?usp=sharing

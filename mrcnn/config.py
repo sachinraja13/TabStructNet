@@ -9,10 +9,10 @@ Written by Waleed Abdulla
 
 import numpy as np
 
-
 # Base Configuration Class
 # Don't use this class directly. Instead, sub-class it and override
 # the configurations you need to change.
+
 
 class Config(object):
     """Base configuration class. For custom configurations, create a
@@ -31,7 +31,7 @@ class Config(object):
     # handle 2 images of 1024x1024px.
     # Adjust based on your GPU memory and image sizes. Use the highest
     # number that your GPU can handle for best performance.
-    IMAGES_PER_GPU = 1 #2
+    IMAGES_PER_GPU = 1  #2
 
     # Number of training steps per epoch
     # This doesn't need to match the size of the training set. Tensorboard
@@ -40,7 +40,7 @@ class Config(object):
     # Validation stats are also calculated at each epoch end and they
     # might take a while, so don't set this too small to avoid spending
     # a lot of time on validation stats.
-    STEPS_PER_EPOCH = 200
+    STEPS_PER_EPOCH = 500
 
     # Number of validation steps to run at the end of every training epoch.
     # A bigger number improves accuracy of validation stats, but slows
@@ -77,7 +77,7 @@ class Config(object):
 
     # Ratios of anchors at each cell (width/height)
     # A value of 1 represents a square anchor, and 0.5 is a wide anchor
-    RPN_ANCHOR_RATIOS = [0.5,1, 2]
+    RPN_ANCHOR_RATIOS = [0.5, 1, 2]
 
     # Anchor stride
     # If 1 then anchors are created for each cell in the backbone feature map.
@@ -90,7 +90,7 @@ class Config(object):
 
     # How many anchors per image to use for RPN training
     RPN_TRAIN_ANCHORS_PER_IMAGE = 768
-    
+
     # ROIs kept after tf.nn.top_k and before non-maximum suppression
     PRE_NMS_LIMIT = 6000
 
@@ -144,7 +144,7 @@ class Config(object):
     # enough positive proposals to fill this and keep a positive:negative
     # ratio of 1:3. You can increase the number of proposals by adjusting
     # the RPN NMS threshold.
-    TRAIN_ROIS_PER_IMAGE = 20
+    TRAIN_ROIS_PER_IMAGE = 512
 
     GRAPH_NEIGHBORS = 20
     # Percent of positive ROIs used to train classifier/mask heads
@@ -193,9 +193,9 @@ class Config(object):
         "mrcnn_class_loss": 1.,
         "mrcnn_bbox_loss": 1.,
         "mrcnn_mask_loss": 1.,
-        "roi_alignment_loss": 10,
-        "row_adj_loss" : 1,
-        "col_adj_loss" : 1
+        "roi_alignment_loss": 1,
+        "row_adj_loss": 1,
+        "col_adj_loss": 1
     }
 
     # Use RPN ROIs or externally generated ROIs for training
@@ -221,11 +221,15 @@ class Config(object):
 
         # Input image size
         if self.IMAGE_RESIZE_MODE == "crop":
-            self.IMAGE_SHAPE = np.array([self.IMAGE_MIN_DIM, self.IMAGE_MIN_DIM,
-                self.IMAGE_CHANNEL_COUNT])
+            self.IMAGE_SHAPE = np.array([
+                self.IMAGE_MIN_DIM, self.IMAGE_MIN_DIM,
+                self.IMAGE_CHANNEL_COUNT
+            ])
         else:
-            self.IMAGE_SHAPE = np.array([self.IMAGE_MAX_DIM, self.IMAGE_MAX_DIM,
-                self.IMAGE_CHANNEL_COUNT])
+            self.IMAGE_SHAPE = np.array([
+                self.IMAGE_MAX_DIM, self.IMAGE_MAX_DIM,
+                self.IMAGE_CHANNEL_COUNT
+            ])
 
         # Image meta data length
         # See compose_image_meta() for details

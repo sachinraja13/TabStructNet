@@ -1,27 +1,12 @@
-## References:
-
-```
-@misc{matterport_maskrcnn_2017,
-  title={Mask R-CNN for object detection and instance segmentation on Keras and TensorFlow},
-  author={Waleed Abdulla},
-  year={2017},
-  publisher={Github},
-  journal={GitHub repository},
-  howpublished={\url{https://github.com/matterport/Mask_RCNN}},
-}
-```
+# Table Structure Recognition using Top-Down and Bottom-Up Cues : TabStructNet
 
 
+This code is developed using the code from 
+* 
 
-```
-@article{rethinkingGraphs,
-  author    = {Qasim, Shah Rukh and Mahmood, Hassan and Shafait, Faisal},
-  title     = {Rethinking Table Recognition using Graph Neural Networks},
-  journal   = {Accepted into ICDAR 2019},
-  volume    = {abs/1905.13391},
-  year      = {2019},
-  url       = {https://arxiv.org/abs/1905.13391},
-  archivePrefix = {arXiv},
-  eprint    = {1905.13391},
-}
-```
+
+##References:
+* Mask R-CNN for object detection and instance segmentation on Keras and TensorFlow; Waleed Abdulla; 2017; https://github.com/matterport/Mask_RCNN
+
+
+* Rethinking Table Recognition using Graph Neural Networks; Qasim, Shah Rukh and Mahmood, Hassan and Shafait, Faisal; ICDAR 2019; https://arxiv.org/abs/1905.13391
