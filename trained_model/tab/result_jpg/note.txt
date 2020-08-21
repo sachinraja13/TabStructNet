@@ -1,0 +1,1 @@
+Cell detection mask images are created here.

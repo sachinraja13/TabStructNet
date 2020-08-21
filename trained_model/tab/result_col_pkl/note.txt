@@ -1,0 +1,1 @@
+Pickle file for column adjacency matrices are created here.
