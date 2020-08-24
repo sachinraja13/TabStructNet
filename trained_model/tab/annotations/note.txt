@@ -1,2 +1,2 @@
-Please add the two jaon files downloaded from https://drive.google.com/drive/folders/1l8n1a-2oRXwaWW-8qlEn9Qj1Fp1edQ-I?usp=sharing
+Please add the two json files downloaded from https://drive.google.com/drive/folders/1l8n1a-2oRXwaWW-8qlEn9Qj1Fp1edQ-I?usp=sharing
 into this folder.
