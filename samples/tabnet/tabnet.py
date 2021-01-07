@@ -333,6 +333,40 @@ def evaluate_tabnet(dataset_path,
     t_start = time.time()
 
     results = []
+    from shutil import rmtree
+    try:
+        rmtree(dataset_path + '/result_col_pkl')
+    except Exception as e:
+        print(e)
+        print("cannot remove " + dataset_path + '/result_col_pkl')
+    try:
+        os.makedirs(dataset_path + '/result_col_pkl')
+    except:
+        print("cannot create " + dataset_path + '/result_col_pkl')
+    try:
+        rmtree(dataset_path + '/result_row_pkl')
+    except:
+        print("cannot remove " + dataset_path + '/result_row_pkl')
+    try:
+        os.makedirs(dataset_path + '/result_row_pkl')
+    except:
+        print("cannot create " + dataset_path + '/result_row_pkl')
+    try:
+        rmtree(dataset_path + '/result_jpg')
+    except:
+        print("cannot remove " + dataset_path + '/result_jpg')
+    try:
+        os.makedirs(dataset_path + '/result_jpg')
+    except:
+        print("cannot create " + dataset_path + '/result_jpg')
+    try:
+        rmtree(dataset_path + '/result_text')
+    except:
+        print("cannot remove " + dataset_path + '/result_text')
+    try:
+        os.makedirs(dataset_path + '/result_text')
+    except:
+        print("cannot create " + dataset_path + '/result_text')
     for i, image_id in enumerate(image_ids):
         # Load image
         image = dataset.load_image(image_id)
@@ -535,7 +569,7 @@ if __name__ == '__main__':
             dataset_train,
             dataset_val,
             learning_rate=config.LEARNING_RATE,
-            epochs=5,  #20,#40,
+            epochs=115,  #20,#40,
             layers='heads',
             augmentation=augmentation)
 
@@ -546,7 +580,7 @@ if __name__ == '__main__':
             dataset_train,
             dataset_val,
             learning_rate=config.LEARNING_RATE,
-            epochs=10,  #50, #40, #120,
+            epochs=120,  #50, #40, #120,
             layers='4+',
             augmentation=augmentation)
 
@@ -557,7 +591,7 @@ if __name__ == '__main__':
             dataset_train,
             dataset_val,
             learning_rate=config.LEARNING_RATE / 10,
-            epochs=15,  #80, #40, #80, #160,
+            epochs=125,  #80, #40, #80, #160,
             layers='all',
             augmentation=augmentation)
 

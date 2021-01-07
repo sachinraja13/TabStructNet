@@ -803,8 +803,128 @@ class DetectionTargetLayer(KE.Layer):
         return [None, None, None, None]
 
 
-def calculate_lstm_features(x):
-    o = KL.LSTM(128)(x)
+def get_balanced_samples_for_training(ground_truth_matrix, predicted_flags,
+                                      config):
+    # return tf.cast(ground_truth_matrix, tf.int32)
+
+    N = tf.constant(config.TRAIN_ROIS_PER_IMAGE)
+    N = tf.tile(tf.expand_dims(N, -1), [config.BATCH_SIZE])
+    max_vertices = config.TRAIN_ROIS_PER_IMAGE
+    samples_per_vertex = config.SAMPLES_PER_VERTEX
+
+    NN = tf.tile(tf.expand_dims(N, -1), [1, max_vertices])
+
+    M = tf.sequence_mask(tf.cast(N, dtype=tf.int64),
+                         maxlen=max_vertices)  # [b, v]
+
+    M = tf.cast(M, dtype=tf.float32)
+    MM = tf.cast(
+        tf.sequence_mask(tf.cast(NN, dtype=tf.int64), maxlen=max_vertices),
+        tf.float32) * M[..., tf.newaxis]  # [b, v, v]
+    MM = tf.expand_dims(predicted_flags, 1) * tf.expand_dims(
+        predicted_flags, 2)
+
+    P = tf.cast(ground_truth_matrix, dtype=tf.float32)
+    X = tf.reduce_sum(P, axis=2)
+    Y = tf.reduce_sum(P, axis=2)
+
+    G_0 = tf.cast(tf.equal(ground_truth_matrix, 0), tf.float32)
+    G_1 = tf.cast(tf.equal(ground_truth_matrix, 1), tf.float32)
+
+    X = tf.reduce_sum(G_0 * MM, axis=2)
+    Y = tf.reduce_sum(G_1 * MM, axis=2)
+
+    P_0 = G_0 * 0.5 * ((X + Y) / X)[..., tf.newaxis] * MM
+    P_1 = G_1 * 0.5 * ((X + Y) / Y)[..., tf.newaxis] * MM
+
+    P = P_0 + P_1
+    P = tf.where(tf.math.is_nan(P), tf.zeros_like(P), P)
+    x = tf.distributions.Categorical(probs=P).sample(
+        sample_shape=(samples_per_vertex))
+    x = tf.transpose(x, perm=[1, 2, 0])
+    return tf.cast(x, tf.int32)
+
+
+def get_samples_for_testing(pseudo_ground_truth_matrix, config):
+    max_vertices = config.DETECTION_MAX_INSTANCES
+    samples_per_vertex = config.DETECTION_MAX_INSTANCES
+    num_batch = config.BATCH_SIZE
+    x = tf.tile(tf.range(0, max_vertices)[tf.newaxis, tf.newaxis, :],
+                multiples=[num_batch, samples_per_vertex, 1])
+    return x
+
+
+def generate_structure_classification_features(graph_features, samples,
+                                               predicted_flags, train_flag,
+                                               config):
+
+    if train_flag:
+        samples_per_vertex = config.SAMPLES_PER_VERTEX
+        max_vertices = config.TRAIN_ROIS_PER_IMAGE
+        num_batch = config.BATCH_SIZE
+    else:
+        samples_per_vertex = config.DETECTION_MAX_INSTANCES
+        max_vertices = config.DETECTION_MAX_INSTANCES
+        num_batch = config.BATCH_SIZE
+    mask = tf.tile(tf.expand_dims(predicted_flags, -1),
+                   [1, 1, samples_per_vertex])
+    mask = tf.tile(tf.expand_dims(mask, -1), [1, 1, 1, 256])
+    samples = tf.cast(samples, tf.int32)
+    samples = tf.where(
+        tf.math.equal(samples, tf.constant(max_vertices, tf.int32)),
+        tf.zeros_like(samples), samples)
+    y = tf.range(0, num_batch)[..., tf.newaxis]
+    y = tf.tile(y, multiples=[1, max_vertices])
+    z = tf.range(0, max_vertices)[tf.newaxis, ..., tf.newaxis]
+    z = tf.tile(z, multiples=[num_batch, 1, 1])
+    batch_range_1 = tf.tile(y[..., tf.newaxis],
+                            multiples=[1, 1, samples_per_vertex])
+    max_vertices_range_1 = tf.tile(z, multiples=[1, 1, samples_per_vertex])
+    indexing_tensor = tf.concat(
+        (batch_range_1[..., tf.newaxis], samples[..., tf.newaxis]), axis=-1)
+    x_graph = tf.gather_nd(graph_features, indexing_tensor) * mask
+    y = tf.expand_dims(graph_features, axis=2)
+    y = tf.tile(y, multiples=[1, 1, samples_per_vertex, 1])
+    concatenated_features = tf.concat((x_graph, y), axis=-1)
+    return concatenated_features
+
+
+def generate_sampled_gt_matrix(gt_matrix, samples, predicted_flags, train_flag,
+                               config):
+
+    if train_flag:
+        samples_per_vertex = config.SAMPLES_PER_VERTEX
+        max_vertices = config.TRAIN_ROIS_PER_IMAGE
+        num_batch = config.BATCH_SIZE
+    else:
+        samples_per_vertex = config.DETECTION_MAX_INSTANCES
+        max_vertices = config.DETECTION_MAX_INSTANCES
+        num_batch = config.BATCH_SIZE
+
+    mask = mask = tf.tile(tf.expand_dims(predicted_flags, -1),
+                          [1, 1, samples_per_vertex])
+    samples = tf.cast(samples, tf.int32)
+    samples = tf.where(
+        tf.math.equal(samples, tf.constant(max_vertices, tf.int32)),
+        tf.zeros_like(samples), samples)
+    y = tf.range(0, num_batch)[..., tf.newaxis]
+    y = tf.tile(y, multiples=[1, max_vertices])
+    z = tf.range(0, max_vertices)[tf.newaxis, ..., tf.newaxis]
+    z = tf.tile(z, multiples=[num_batch, 1, 1])
+    batch_range_1 = tf.tile(y[..., tf.newaxis],
+                            multiples=[1, 1, samples_per_vertex])
+    max_vertices_range_1 = tf.tile(z, multiples=[1, 1, samples_per_vertex])
+    indexing_tensor_for_adj_matrices = tf.concat(
+        (batch_range_1[..., tf.newaxis], max_vertices_range_1[..., tf.newaxis],
+         samples[..., tf.newaxis]),
+        axis=-1)
+    gathered_gt_matrix = tf.gather_nd(gt_matrix,
+                                      indexing_tensor_for_adj_matrices) * mask
+    return gathered_gt_matrix
+
+
+def calculate_lstm_features(x, config):
+    o = KL.TimeDistributed(KL.LSTM(config.LSTM_DEPTH))(x)
     return o
 
 
@@ -816,9 +936,9 @@ class LSTMLayer(KE.Layer):
     def call(self, input):
         self.dim = input.shape[1]
 
-        output = utils.batch_slice([input],
-                                   lambda x: calculate_lstm_features(x),
-                                   self.config.IMAGES_PER_GPU)
+        output = utils.batch_slice(
+            [input], lambda x: calculate_lstm_features(x, self.config),
+            self.config.IMAGES_PER_GPU)
 
         return output
 
@@ -878,7 +998,7 @@ def refine_structure_detections_graph(image_features,
     # Filter out background boxes
     keep = tf.where(class_ids > 0)[:, 0]
     # Filter out low confidence boxes
-    #if config.DETECTION_MIN_CONFIDENCE:
+    # if config.DETECTION_MIN_CONFIDENCE:
     #    conf_keep = tf.where(class_scores >= 0.0)[:, 0]
     #    keep = tf.sets.set_intersection(tf.expand_dims(keep, 0),
     #                                    tf.expand_dims(conf_keep, 0))
@@ -955,7 +1075,7 @@ def refine_structure_detections_graph(image_features,
     # Determine positive and negative ROIs
     roi_iou_max = tf.reduce_max(overlaps, axis=1)
     # 1. Positive ROIs are those with >= 0.5 IoU with a GT box
-    positive_roi_bool = (roi_iou_max >= 0.2)
+    positive_roi_bool = (roi_iou_max >= 0.8)
     positive_indices = tf.where(positive_roi_bool)[:, 0]
     # 2. Negative ROIs are those with < 0.5 with every GT box. Skip crowds.
     positive_overlaps = tf.gather(overlaps, positive_indices)
@@ -1027,8 +1147,8 @@ def refine_structure_detections_graph(image_features,
                 tf.math.greater_equal(tf.expand_dims(roi_gt_end_cols, 0),
                                       tf.expand_dims(roi_gt_end_cols, 1)))))
     adj_cols = tf.cast(adj_cols, tf.float32)
-    print(image_features.shape)
     conv_head_y = image_features
+    #conv_head_x = image_features
     conv_head_x = K.permute_dimensions(image_features, [1, 0, 2])
     gt_y1, gt_x1, gt_y2, gt_x2 = tf.split(roi_gt_boxes, 4, axis=1)
     roi_gt_boxes = tf.concat([gt_y1, gt_x1, gt_y2, gt_x2], 1)
@@ -1037,7 +1157,7 @@ def refine_structure_detections_graph(image_features,
     gt_boxes_denorm = denorm_boxes_graph(roi_gt_boxes, [256, 256])
     gt_boxes_denorm = tf.cast(gt_boxes_denorm, tf.float32)
     vertices_y, vertices_x, vertices_y2, vertices_x2 = tf.split(
-        pred_boxes_denorm, 4, axis=1)
+        gt_boxes_denorm, 4, axis=1)
     vertices_y = tf.squeeze(vertices_y)
     vertices_x = tf.squeeze(vertices_x)
     vertices_y2 = tf.squeeze(vertices_y2)
@@ -1054,66 +1174,23 @@ def refine_structure_detections_graph(image_features,
                                 [tf.shape(pred_boxes_denorm)[0], 1])
     vertices_y_mid = tf.reshape(vertices_y_mid,
                                 [tf.shape(pred_boxes_denorm)[0], 1])
-    #vertices_range = tf.range(0, tf.shape(pred_boxes_denorm)[0])[..., tf.newaxis]
-    #vertices_range = tf.cast(vertices_range, tf.float32)
+
     indexing_tensor = tf.concat((vertices_y_mid, vertices_x_mid), axis=-1)
     indexing_tensor = tf.cast(indexing_tensor, tf.int32)
     indexing_tensor_x_mid = tf.cast(vertices_x_mid, tf.int32)
     indexing_tensor_y_mid = tf.cast(vertices_y_mid, tf.int32)
-    gathered_x_mid = tf.gather_nd(conv_head_x, indexing_tensor_x_mid)
-    gathered_y_mid = tf.gather_nd(conv_head_y, indexing_tensor_y_mid)
+    gathered_x_mid_row = tf.gather_nd(conv_head_x, indexing_tensor_x_mid)
+    gathered_y_mid_row = tf.gather_nd(conv_head_y, indexing_tensor_y_mid)
+    gathered_x_mid_col = tf.gather_nd(conv_head_x, indexing_tensor_x_mid)
+    gathered_y_mid_col = tf.gather_nd(conv_head_y, indexing_tensor_y_mid)
 
-    #indexing_tensor = tf.reshape(indexing_tensor, [-1, 3])
-    # vertex_features = tf.gather_nd(image_features, indexing_tensor)
-    # conv_width = tf.shape(image_features)[1]
-    # conv_depth = tf.shape(image_features)[-1]
-    # conv_range = tf.range(0, conv_width, dtype=tf.int32)
-    # mask_gt_y1 = tf.math.greater_equal(conv_range, vertices_y[:, tf.newaxis])
-    # # print("mask_gt_y1 : ######" + str(mask_gt_y1.shape) + " ######")
-    # mask_lt_y2 = tf.math.less_equal(conv_range, vertices_y2[:, tf.newaxis])
-    # # print("mask_lt_y2 : ######" + str(mask_lt_y2.shape) + " ######")
-    # mask_y_mid = tf.math.logical_and(mask_gt_y1, mask_lt_y2)
-    # mask_y_mid = tf.tile(tf.expand_dims(mask_y_mid, -1), [1, 1, conv_depth])
-
-    # mask_gt_x1 = tf.math.greater_equal(conv_range, vertices_x[:, tf.newaxis])
-    # # print("mask_gt_y1 : ######" + str(mask_gt_x1.shape) + " ######")
-    # mask_lt_x2 = tf.math.less_equal(conv_range, vertices_x2[:, tf.newaxis])
-    # # print("mask_lt_y2 : ######" + str(mask_lt_x2.shape) + " ######")
-    # mask_x_mid = tf.math.logical_and(mask_gt_x1, mask_lt_x2)
-    # mask_x_mid = tf.tile(tf.expand_dims(mask_x_mid, -1), [1, 1, conv_depth])
-    # # print("Here.....")
-    # # print(conv_width)
-    # # print(conv_depth)
-    # gathered_values_x_mid = tf.where(
-    #     mask_x_mid, gathered_x_mid,
-    #     tf.zeros([tf.shape(positive_preds)[0], conv_width, conv_depth],
-    #              dtype=tf.float32))
-
-    # gathered_values_y_mid = tf.where(
-    #     mask_y_mid, gathered_y_mid,
-    #     tf.zeros([tf.shape(positive_preds)[0], conv_width, conv_depth],
-    #              dtype=tf.float32))
-
-    # gathered_values_x_mid = tf.cond(
-    #     tf.equal(tf.shape(gathered_values_x_mid)[0], tf.constant(0)),
-    #     lambda: tf.cast(tf.zeros(shape=(1, 256, 256)), tf.float32),
-    #     lambda: tf.cast(gathered_values_x_mid, tf.float32))
-    # gathered_values_y_mid = tf.cond(
-    #     tf.equal(tf.shape(gathered_values_y_mid)[0], tf.constant(0)),
-    #     lambda: tf.cast(tf.zeros(shape=(1, 256, 256)), tf.float32),
-    #     lambda: tf.cast(gathered_values_y_mid, tf.float32))
-
-    # vertex_features = tf.cond(
-    #     tf.greater(num_detected_boxes, tf.constant(0)),
-    #     lambda: tf.gather_nd(image_features, indexing_tensor),
-    #     lambda: tf.cast(concatenated_lstm_output, tf.float32))
-    # vertex_features = tf.gather_nd(image_features, indexing_tensor)
     stuct_info = tf.concat([
         tf.expand_dims(roi_gt_start_rows, -1),
         tf.expand_dims(roi_gt_start_cols, -1),
         tf.expand_dims(roi_gt_end_rows, -1),
         tf.expand_dims(roi_gt_end_cols, -1)
     ], 1)
+    predicted_flags = tf.ones([tf.shape(positive_preds)[0]], tf.float32)
     P = tf.maximum(config.TRAIN_ROIS_PER_IMAGE - tf.shape(positive_preds)[0],
                    0)
     pred_boxes = tf.pad(positive_preds, [(0, P), (0, 0)])
@@ -1122,23 +1199,15 @@ def refine_structure_detections_graph(image_features,
     stuct_info = tf.pad(stuct_info, [(0, P), (0, 0)])
     adj_rows = tf.pad(adj_rows, [(0, P), (0, P)])
     adj_cols = tf.pad(adj_cols, [(0, P), (0, P)])
-    #vertex_features = tf.pad(vertex_features, [(0, P), (0, 0)])
-    # concatenated_lstm_output = tf.pad(concatenated_lstm_output, [(0, P),
-    #                                                              (0, 0)])
     pred_boxes_denorm = tf.pad(pred_boxes_denorm, [(0, P), (0, 0)])
-    gathered_x_mid = tf.pad(gathered_x_mid, [(0, P), (0, 0), (0, 0)])
-    gathered_y_mid = tf.pad(gathered_y_mid, [(0, P), (0, 0), (0, 0)])
+    gathered_x_mid_row = tf.pad(gathered_x_mid_row, [(0, P), (0, 0), (0, 0)])
+    gathered_y_mid_row = tf.pad(gathered_y_mid_row, [(0, P), (0, 0), (0, 0)])
+    gathered_x_mid_col = tf.pad(gathered_x_mid_col, [(0, P), (0, 0), (0, 0)])
+    gathered_y_mid_col = tf.pad(gathered_y_mid_col, [(0, P), (0, 0), (0, 0)])
+    predicted_flags = tf.pad(predicted_flags, [(0, P)])
+    # num_detected_boxes = tf.reshape(num_detected_boxes, [1])
 
-    print("Graph vertices collection....")
-    print("Image features..." + str(image_features.shape))
-
-    print("Indexing tensor..." + str(indexing_tensor.shape))
-
-    #print(pred_boxes.shape)
-    #print(stuct_info.shape)
-    #print(roi_gt_boxes.shape)
-
-    return num_detected_boxes, pred_boxes, gt_boxes_denorm, pred_boxes_denorm, roi_gt_boxes, stuct_info, adj_rows, adj_cols, gathered_x_mid, gathered_y_mid
+    return num_detected_boxes, predicted_flags, pred_boxes, gt_boxes_denorm, pred_boxes_denorm, roi_gt_boxes, stuct_info, adj_rows, adj_cols, gathered_x_mid_row, gathered_y_mid_row, gathered_x_mid_col, gathered_y_mid_col
 
 
 class StructureDetectionLayer(KE.Layer):
@@ -1191,7 +1260,8 @@ class StructureDetectionLayer(KE.Layer):
         return detections_batch
 
     def compute_output_shape(self, input_shape):
-        return [(None), (None, self.config.TRAIN_ROIS_PER_IMAGE, 4),
+        return [(None), (None, self.config.TRAIN_ROIS_PER_IMAGE),
+                (None, self.config.TRAIN_ROIS_PER_IMAGE, 4),
                 (None, self.config.TRAIN_ROIS_PER_IMAGE, 4),
                 (None, self.config.TRAIN_ROIS_PER_IMAGE, 4),
                 (None, self.config.TRAIN_ROIS_PER_IMAGE, 4),
@@ -1200,6 +1270,10 @@ class StructureDetectionLayer(KE.Layer):
                  self.config.TRAIN_ROIS_PER_IMAGE),
                 (None, self.config.TRAIN_ROIS_PER_IMAGE,
                  self.config.TRAIN_ROIS_PER_IMAGE),
+                (None, self.config.TRAIN_ROIS_PER_IMAGE, 256,
+                 self.config.TOP_DOWN_PYRAMID_SIZE),
+                (None, self.config.TRAIN_ROIS_PER_IMAGE, 256,
+                 self.config.TOP_DOWN_PYRAMID_SIZE),
                 (None, self.config.TRAIN_ROIS_PER_IMAGE, 256,
                  self.config.TOP_DOWN_PYRAMID_SIZE),
                 (None, self.config.TRAIN_ROIS_PER_IMAGE, 256,
@@ -1527,8 +1601,9 @@ class GarNet(KL.Layer):
         base_config = super(GarNet, self).get_config()
         return dict(list(base_config.items()) + list(config.items()))
 
-
     # tf.ragged FIXME? the last one should be no problem
+
+
 class weighted_sum_layer(keras.layers.Layer):
     def __init__(self, **kwargs):
         super(weighted_sum_layer, self).__init__(**kwargs)
@@ -1544,9 +1619,9 @@ class weighted_sum_layer(keras.layers.Layer):
 
     def call(self, inputs):
         # input #B x E x F
-        weights = inputs[:, :, 0:1]  #B x E x 1
+        weights = inputs[:, :, 0:1]  # B x E x 1
         tosum = inputs[:, :, 1:]
-        weighted = weights * tosum  #broadcast to B x E x F-1
+        weighted = weights * tosum  # broadcast to B x E x F-1
         return tf.reduce_sum(weighted, axis=1)
 
 
@@ -1665,24 +1740,16 @@ def refine_detections_graph(rois, probs, deltas, window, image_features,
                                 [tf.shape(pred_boxes_denorm)[0], 1])
     vertices_y_mid = tf.reshape(vertices_y_mid,
                                 [tf.shape(pred_boxes_denorm)[0], 1])
-    #vertices_range = tf.range(0, tf.shape(pred_boxes_denorm)[0])[..., tf.newaxis]
-    #vertices_range = tf.cast(vertices_range, tf.float32)
     conv_head_y = image_features
     conv_head_x = K.permute_dimensions(image_features, [1, 0, 2])
     indexing_tensor = tf.concat((vertices_y_mid, vertices_x_mid), axis=-1)
     indexing_tensor = tf.cast(indexing_tensor, tf.int32)
     indexing_tensor_x_mid = tf.cast(vertices_x_mid, tf.int32)
     indexing_tensor_y_mid = tf.cast(vertices_y_mid, tf.int32)
-    gathered_x_mid = tf.gather_nd(conv_head_x, indexing_tensor_x_mid)
-    gathered_y_mid = tf.gather_nd(conv_head_y, indexing_tensor_y_mid)
-    # indexing_tensor = tf.concat(
-    #     (vertices_y_mid[..., tf.newaxis], vertices_x_mid[..., tf.newaxis]),
-    #     axis=-1)
-    # indexing_tensor = tf.cast(indexing_tensor, tf.int32)
-    # vertex_features = tf.gather_nd(image_features, indexing_tensor)
-    # vertex_features = tf.reshape(vertex_features,
-    #                              [-1, config.TOP_DOWN_PYRAMID_SIZE])
-    #pred_boxes_denorm = tf.cast(pred_boxes_denorm, tf.float32)
+    gathered_x_mid_row = tf.gather_nd(conv_head_x, indexing_tensor_x_mid)
+    gathered_y_mid_row = tf.gather_nd(conv_head_y, indexing_tensor_y_mid)
+    gathered_x_mid_col = tf.gather_nd(conv_head_x, indexing_tensor_x_mid)
+    gathered_y_mid_col = tf.gather_nd(conv_head_y, indexing_tensor_y_mid)
     detections = tf.concat([
         tf.gather(refined_rois, keep),
         tf.to_float(tf.gather(class_ids, keep))[..., tf.newaxis],
@@ -1692,13 +1759,23 @@ def refine_detections_graph(rois, probs, deltas, window, image_features,
 
     # Pad with zeros if detections < DETECTION_MAX_INSTANCES
     gap = config.DETECTION_MAX_INSTANCES - tf.shape(detections)[0]
+    detection_flags = tf.ones([tf.shape(detections)[0]], tf.float32)
     detections = tf.pad(detections, [(0, gap), (0, 0)], "CONSTANT")
     pred_boxes_denorm = tf.pad(pred_boxes_denorm, [(0, gap), (0, 0)])
     pred_boxes_denorm = tf.cast(pred_boxes_denorm, tf.float32)
-    gathered_x_mid = tf.pad(gathered_x_mid, [(0, gap), (0, 0), (0, 0)])
-    gathered_y_mid = tf.pad(gathered_y_mid, [(0, gap), (0, 0), (0, 0)])
+    gathered_x_mid_row = tf.pad(gathered_x_mid_row, [(0, gap), (0, 0), (0, 0)])
+    gathered_y_mid_row = tf.pad(gathered_y_mid_row, [(0, gap), (0, 0), (0, 0)])
+    gathered_x_mid_col = tf.pad(gathered_x_mid_col, [(0, gap), (0, 0), (0, 0)])
+    gathered_y_mid_col = tf.pad(gathered_y_mid_col, [(0, gap), (0, 0), (0, 0)])
+    detection_flags = tf.pad(detection_flags, [(0, gap)])
+    pseudo_gt_row_matrix = tf.zeros(
+        (config.DETECTION_MAX_INSTANCES, config.DETECTION_MAX_INSTANCES),
+        tf.float32)
+    pseudo_gt_col_matrix = tf.zeros(
+        (config.DETECTION_MAX_INSTANCES, config.DETECTION_MAX_INSTANCES),
+        tf.float32)
 
-    return detections, pred_boxes_denorm, gathered_x_mid, gathered_y_mid
+    return detection_flags, detections, pred_boxes_denorm, gathered_x_mid_row, gathered_y_mid_row, gathered_x_mid_col, gathered_y_mid_col, pseudo_gt_row_matrix, pseudo_gt_col_matrix
 
 
 class DetectionLayer(KE.Layer):
@@ -1738,7 +1815,7 @@ class DetectionLayer(KE.Layer):
         # [batch, num_detections, (y1, x1, y2, x2, class_id, class_score)] in
         # normalized coordinates
         return detections_batch
-        #tf.reshape(
+        # tf.reshape(
         #    detections_batch,
         #    [self.config.BATCH_SIZE, self.config.DETECTION_MAX_INSTANCES, 6]),tf.reshape(
         #    pred_boxes_denorm,
@@ -1747,12 +1824,21 @@ class DetectionLayer(KE.Layer):
         #    [self.config.BATCH_SIZE, self.config.DETECTION_MAX_INSTANCES, self.config.TOP_DOWN_PYRAMID_SIZE])
 
     def compute_output_shape(self, input_shape):
-        return [(None, self.config.DETECTION_MAX_INSTANCES, 6),
+        return [(None, self.config.DETECTION_MAX_INSTANCES),
+                (None, self.config.DETECTION_MAX_INSTANCES, 6),
                 (None, self.config.DETECTION_MAX_INSTANCES, 4),
                 (None, self.config.DETECTION_MAX_INSTANCES, 256,
                  self.config.TOP_DOWN_PYRAMID_SIZE),
                 (None, self.config.DETECTION_MAX_INSTANCES, 256,
-                 self.config.TOP_DOWN_PYRAMID_SIZE)]
+                 self.config.TOP_DOWN_PYRAMID_SIZE),
+                (None, self.config.DETECTION_MAX_INSTANCES, 256,
+                 self.config.TOP_DOWN_PYRAMID_SIZE),
+                (None, self.config.DETECTION_MAX_INSTANCES, 256,
+                 self.config.TOP_DOWN_PYRAMID_SIZE),
+                (None, self.config.DETECTION_MAX_INSTANCES,
+                 self.config.DETECTION_MAX_INSTANCES),
+                (None, self.config.DETECTION_MAX_INSTANCES,
+                 self.config.DETECTION_MAX_INSTANCES)]
 
 
 ############################################################
@@ -1978,53 +2064,40 @@ def smooth_l1_loss(y_true, y_pred):
 
 
 def adjacency_loss_old(y_true, y_pred, num_detected_boxes):
-    """Implements Smooth-L1 loss.
-    y_true and y_pred are typically: [N, 4], but could be any shape.
-    """
-    print(y_true.shape)
-    print(y_pred.shape)
+    mask = tf.sequence_mask(num_detected_boxes, ROIS)
+    mask = tf.cast(mask, tf.float32)
+    mask_pairwise = tf.expand_dims(mask, 1) * tf.expand_dims(mask, 2)
+    mask_pairwise = tf.cast(mask_pairwise, tf.float32)
+    mask = tf.tile(tf.expand_dims(mask_pairwise, -1), [1, 1, 1, 2])
+    mask = tf.cast(mask, tf.float32)
     y_true = tf.cast(y_true, tf.int32)
-    total_count = tf.cast(tf.size(y_true), tf.float32)
+    y_true = tf.cast(y_true, tf.int32)
+    total_count = tf.cast(tf.math.count_nonzero(mask),
+                          tf.float32) + tf.constant([0.0000001], tf.float32)
     count_ones = tf.cast(tf.math.count_nonzero(y_true),
-                         tf.float32) + tf.constant([1.0], tf.float32)
+                         tf.float32) + tf.constant([0.0000001], tf.float32)
     count_zeros = total_count - count_ones
     pos_weight = tf.math.divide(count_zeros, count_ones)
     #loss = tf.nn.softmax_cross_entropy_with_logits_v2(labels=tf.one_hot(y_true, depth=2), logits=y_pred)
-    loss = tf.nn.weighted_cross_entropy_with_logits(logits=y_pred,
-                                                    targets=tf.one_hot(
-                                                        y_true, depth=2),
-                                                    pos_weight=pos_weight)
+    loss = tf.nn.weighted_cross_entropy_with_logits(
+        logits=y_pred,
+        targets=tf.one_hot(y_true, depth=2),
+        pos_weight=pos_weight) * mask
+    loss = tf.reduce_mean(loss, axis=-1)
+    loss = tf.reduce_sum(loss,
+                         axis=-1) / (tf.cast(num_detected_boxes, tf.float32) +
+                                     tf.constant(0.00000001, dtype=tf.float32))
     loss = tf.reduce_mean(loss)
     return loss
 
 
 def adjacency_loss(y_true, y_pred, num_detected_boxes):
-    """Implements Smooth-L1 loss.
-    y_true and y_pred are typically: [N, 4], but could be any shape.
-    """
-    print("**********************")
-    print(y_true.shape)
-    print(y_pred.shape)
     mask = tf.sequence_mask(num_detected_boxes, ROIS)
+    mask = tf.expand_dims(mask, -1)
     mask = tf.cast(mask, tf.float32)
-    mask_pairwise = tf.expand_dims(mask, 1) * tf.expand_dims(mask, 2)
-    mask_pairwise_tiled = tf.tile(tf.expand_dims(mask_pairwise, -1),
-                                  [1, 1, 1, 2])
-    y_true = tf.cast(y_true, tf.float32)
-    mask_pairwise = tf.cast(mask_pairwise, tf.float32)
-    mask_pairwise_tiled = tf.cast(mask_pairwise_tiled, tf.float32)
-    total_count = tf.cast(tf.math.count_nonzero(mask), tf.float32)
-    count_ones = tf.cast(tf.math.count_nonzero(y_true * mask_pairwise),
-                         tf.float32) + tf.constant([0.001], tf.float32)
-    count_zeros = total_count - count_ones
-    pos_weight = tf.math.divide(count_zeros, count_ones)
     y_true = tf.cast(y_true, tf.int32)
-    #loss = tf.nn.softmax_cross_entropy_with_logits_v2(labels=tf.one_hot(y_true, depth=2), logits=y_pred)
-    loss = tf.nn.weighted_cross_entropy_with_logits(
-        logits=y_pred,
-        targets=tf.one_hot(y_true, depth=2),
-        pos_weight=pos_weight) * mask_pairwise_tiled
-    print(loss.shape)
+    loss = tf.nn.softmax_cross_entropy_with_logits_v2(
+        labels=tf.one_hot(y_true, depth=2), logits=y_pred) * mask
     loss = tf.reduce_mean(loss, axis=-1)
     loss = tf.reduce_sum(loss,
                          axis=-1) / (tf.cast(num_detected_boxes, tf.float32) +
@@ -2058,44 +2131,6 @@ def rpn_class_loss_graph(rpn_match, rpn_class_logits):
     return loss
 
 
-def rpn_bbox_structural_loss_graph_old(roi_box_coordinate, roi_gt_coordinate,
-                                       segments, num_detected_boxes):
-    #tf.InteractiveSession()
-    segments = tf.cast(segments, tf.float32)
-    roi_box_pairwise_diff = tf.expand_dims(
-        roi_box_coordinate, 1) - tf.expand_dims(roi_box_coordinate, 2)
-    roi_gt_box_pairwise_diff = tf.expand_dims(
-        roi_gt_coordinate, 1) - tf.expand_dims(roi_gt_coordinate, 2)
-    pairwise_equal_segments = tf.equal(tf.expand_dims(segments, 1),
-                                       tf.expand_dims(segments, 2))
-    pairwise_equal_segments = tf.cast(pairwise_equal_segments, tf.float32)
-    #print(roi_gt_box_pairwise_diff.shape)
-    #print(pairwise_equal_segments.eval())
-    pairwise_diff_square = tf.square(
-        (roi_gt_box_pairwise_diff * pairwise_equal_segments) -
-        (roi_box_pairwise_diff * pairwise_equal_segments)) / 2
-    sum_error_per_channel = tf.math.reduce_sum(pairwise_diff_square,
-                                               axis=[1, 2])
-    count_non_zero_per_channel = tf.cast(
-        tf.math.count_nonzero(pairwise_diff_square, axis=[1, 2]), tf.float32)
-    #print(sum_error_per_channel.shape)
-    #print(count_non_zero_per_channel.shape)
-    avg_loss = sum_error_per_channel / tf.math.add(
-        count_non_zero_per_channel, tf.constant([0.000001], dtype=tf.float32))
-    #print(avg_loss.shape)
-    total_loss = tf.math.reduce_sum(avg_loss)
-    #zero = tf.constant(0, dtype=tf.float32)
-    #non_zero_gts = tf.gather_nd(roi_gt_coordinate, tf.where(tf.not_equal(roi_gt_coordinate, zero)))
-    #gt_equals = tf.equal(tf.expand_dims(non_zero_gts, 0), tf.expand_dims(non_zero_gts, 1))
-    #gt_equals = tf.cast(gt_equals, tf.float32)
-    #gt_equals = tf.matrix_set_diag(gt_equals, tf.zeros(tf.shape(gt_equals)[0]))
-    #return tf.math.reduce_sum(gt_equals)
-
-    #return pairwise_equal_segments
-    #return tf.square((roi_gt_box_pairwise_diff * pairwise_equal_segments))
-    return total_loss
-
-
 def rpn_bbox_structural_loss_graph(roi_box_coordinate, roi_gt_coordinate,
                                    segments, num_detected_boxes):
 
@@ -2113,8 +2148,6 @@ def rpn_bbox_structural_loss_graph(roi_box_coordinate, roi_gt_coordinate,
     pairwise_equal_segments = tf.cast(pairwise_equal_segments, tf.float32)
     roi_gt_box_pairwise_diff = roi_gt_box_pairwise_diff * pairwise_equal_segments
     roi_box_pairwise_diff = roi_box_pairwise_diff * pairwise_equal_segments
-    #print(roi_gt_box_pairwise_diff.shape)
-    #print(pairwise_equal_segments.eval())
     loss = tf.compat.v1.losses.mean_squared_error(
         roi_gt_box_pairwise_diff, roi_box_pairwise_diff) * mask_pairwise
     loss = tf.cast(tf.reduce_sum(loss, [1, 2, 3]),
@@ -2359,7 +2392,7 @@ def load_image_gt(dataset,
     start_rows, start_cols, end_rows, end_cols = dataset.load_structure_information_from_boxes(
         bbox)
 
-    #TODO : Extract structure information from boxes
+    # TODO : Extract structure information from boxes
 
     # Active classes
     # Different datasets have different classes, so track the
@@ -2803,19 +2836,16 @@ def data_generator(dataset,
             # If the image source is not to be augmented pass None as augmentation
             if dataset.image_info[image_id][
                     'source'] in no_augmentation_sources:
-                print("$$$$$$$$$$$$$HERE")
-                image, image_meta, gt_class_ids, gt_boxes, gt_masks, gt_start_rows, gt_start_cols, gt_end_rows, gt_end_cols  = \
-                load_image_gt(dataset, config, image_id, augment=augment,
-                              augmentation=None,
-                              use_mini_mask=config.USE_MINI_MASK)
+                image, image_meta, gt_class_ids, gt_boxes, gt_masks, gt_start_rows, gt_start_cols, gt_end_rows, gt_end_cols = \
+                    load_image_gt(dataset, config, image_id, augment=augment,
+                                  augmentation=None,
+                                  use_mini_mask=config.USE_MINI_MASK)
             else:
                 image, image_meta, gt_class_ids, gt_boxes, gt_masks, gt_start_rows, gt_start_cols, gt_end_rows, gt_end_cols = \
                     load_image_gt(dataset, config, image_id, augment=augment,
-                                augmentation=augmentation,
-                                use_mini_mask=config.USE_MINI_MASK)
+                                  augmentation=augmentation,
+                                  use_mini_mask=config.USE_MINI_MASK)
 
-            #print(str(image))
-            #print(str(image_meta))
             # Skip images that have no instances. This can happen in cases
             # where we train on a subset of classes and the image doesn't
             # have any of the classes we care about.
@@ -2893,16 +2923,7 @@ def data_generator(dataset,
                 gt_end_rows = gt_end_rows[ids]
                 gt_end_cols = gt_end_cols[ids]
                 gt_masks = gt_masks[:, :, ids]
-            #print(image_meta)
-            # print(gt_boxes[:,0])
-            # print(gt_start_rows)
-            # print(gt_boxes[:,1])
-            # print(gt_start_cols)
-            # print(gt_boxes[:,2])
-            # print(gt_end_rows)
-            # print(gt_boxes[:,3])
-            # print(gt_end_cols)
-            # Add to batch
+
             batch_image_meta[b] = image_meta
             batch_rpn_match[b] = rpn_match[:, np.newaxis]
             batch_rpn_bbox[b] = rpn_bbox
@@ -2924,7 +2945,7 @@ def data_generator(dataset,
             b += 1
 
             # Batch full?
-            #print(batch_gt_start_rows)
+            # print(batch_gt_start_rows)
             if b >= batch_size:
                 inputs = [
                     batch_images, batch_image_meta, batch_rpn_match,
@@ -2961,244 +2982,11 @@ def data_generator(dataset,
                 raise
 
 
-def generate_sample(dataset,
-                    config,
-                    shuffle=True,
-                    augment=False,
-                    augmentation=None,
-                    random_rois=0,
-                    batch_size=1,
-                    detection_targets=False,
-                    no_augmentation_sources=None):
-    """A generator that returns images and corresponding target class ids,
-    bounding box deltas, and masks.
-
-    dataset: The Dataset object to pick data from
-    config: The model config object
-    shuffle: If True, shuffles the samples before every epoch
-    augment: (deprecated. Use augmentation instead). If true, apply random
-        image augmentation. Currently, only horizontal flipping is offered.
-    augmentation: Optional. An imgaug (https://github.com/aleju/imgaug) augmentation.
-        For example, passing imgaug.augmenters.Fliplr(0.5) flips images
-        right/left 50% of the time.
-    random_rois: If > 0 then generate proposals to be used to train the
-                 network classifier and mask heads. Useful if training
-                 the Mask RCNN part without the RPN.
-    batch_size: How many images to return in each call
-    detection_targets: If True, generate detection targets (class IDs, bbox
-        deltas, and masks). Typically for debugging or visualizations because
-        in trainig detection targets are generated by DetectionTargetLayer.
-    no_augmentation_sources: Optional. List of sources to exclude for
-        augmentation. A source is string that identifies a dataset and is
-        defined in the Dataset class.
-
-    Returns a Python generator. Upon calling next() on it, the
-    generator returns two lists, inputs and outputs. The contents
-    of the lists differs depending on the received arguments:
-    inputs list:
-    - images: [batch, H, W, C]
-    - image_meta: [batch, (meta data)] Image details. See compose_image_meta()
-    - rpn_match: [batch, N] Integer (1=positive anchor, -1=negative, 0=neutral)
-    - rpn_bbox: [batch, N, (dy, dx, log(dh), log(dw))] Anchor bbox deltas.
-    - gt_class_ids: [batch, MAX_GT_INSTANCES] Integer class IDs
-    - gt_boxes: [batch, MAX_GT_INSTANCES, (y1, x1, y2, x2)]
-    - gt_masks: [batch, height, width, MAX_GT_INSTANCES]. The height and width
-                are those of the image unless use_mini_mask is True, in which
-                case they are defined in MINI_MASK_SHAPE.
-
-    outputs list: Usually empty in regular training. But if detection_targets
-        is True then the outputs list contains target class_ids, bbox deltas,
-        and masks.
-    """
-    b = 0  # batch item index
-    image_index = -1
-    image_ids = np.copy(dataset.image_ids)
-    error_count = 0
-    no_augmentation_sources = no_augmentation_sources or []
-
-    # Anchors
-    # [anchor_count, (y1, x1, y2, x2)]
-    backbone_shapes = compute_backbone_shapes(config, config.IMAGE_SHAPE)
-    anchors = utils.generate_pyramid_anchors(config.RPN_ANCHOR_SCALES,
-                                             config.RPN_ANCHOR_RATIOS,
-                                             backbone_shapes,
-                                             config.BACKBONE_STRIDES,
-                                             config.RPN_ANCHOR_STRIDE)
-
-    # Keras requires a generator to run indefinitely.
-    #while True:
-    try:
-        # Increment index to pick next image. Shuffle if at the start of an epoch.
-        image_index = (image_index + 1) % len(image_ids)
-        if shuffle and image_index == 0:
-            np.random.shuffle(image_ids)
-
-        # Get GT bounding boxes and masks for image.
-        image_id = image_ids[image_index]
-
-        # If the image source is not to be augmented pass None as augmentation
-        if dataset.image_info[image_id]['source'] in no_augmentation_sources:
-            print("$$$$$$$$$$$$$HERE")
-            image, image_meta, gt_class_ids, gt_boxes, gt_masks, gt_start_rows, gt_start_cols, gt_end_rows, gt_end_cols  = \
-            load_image_gt(dataset, config, image_id, augment=augment,
-                            augmentation=None,
-                            use_mini_mask=config.USE_MINI_MASK)
-        else:
-            image, image_meta, gt_class_ids, gt_boxes, gt_masks, gt_start_rows, gt_start_cols, gt_end_rows, gt_end_cols = \
-                load_image_gt(dataset, config, image_id, augment=augment,
-                            augmentation=augmentation,
-                            use_mini_mask=config.USE_MINI_MASK)
-
-        #print(str(image))
-        #print(str(image_meta))
-        # Skip images that have no instances. This can happen in cases
-        # where we train on a subset of classes and the image doesn't
-        # have any of the classes we care about.
-        #if not np.any(gt_class_ids > 0):
-        #    continue
-
-        # RPN Targets
-        rpn_match, rpn_bbox = build_rpn_targets(image.shape, anchors,
-                                                gt_class_ids, gt_boxes, config)
-
-        # Mask R-CNN Targets
-        if random_rois:
-            rpn_rois = generate_random_rois(image.shape, random_rois,
-                                            gt_class_ids, gt_boxes)
-            if detection_targets:
-                rois, mrcnn_class_ids, mrcnn_bbox, mrcnn_mask =\
-                    build_detection_targets(
-                        rpn_rois, gt_class_ids, gt_boxes, gt_masks, config)
-        #print(image.shape)
-        # Init batch arrays
-        if b == 0:
-            batch_image_meta = np.zeros((batch_size, ) + image_meta.shape,
-                                        dtype=image_meta.dtype)
-            batch_rpn_match = np.zeros([batch_size, anchors.shape[0], 1],
-                                       dtype=rpn_match.dtype)
-            batch_rpn_bbox = np.zeros(
-                [batch_size, config.RPN_TRAIN_ANCHORS_PER_IMAGE, 4],
-                dtype=rpn_bbox.dtype)
-            batch_images = np.zeros((batch_size, ) + image.shape,
-                                    dtype=np.float32)
-            batch_gt_class_ids = np.zeros(
-                (batch_size, config.MAX_GT_INSTANCES), dtype=np.int32)
-            batch_gt_boxes = np.zeros((batch_size, config.MAX_GT_INSTANCES, 4),
-                                      dtype=np.int32)
-            batch_gt_masks = np.zeros(
-                (batch_size, gt_masks.shape[0], gt_masks.shape[1],
-                 config.MAX_GT_INSTANCES),
-                dtype=gt_masks.dtype)
-            batch_gt_start_rows = np.zeros(
-                (batch_size, config.MAX_GT_INSTANCES), dtype=np.int32)
-            batch_gt_start_cols = np.zeros(
-                (batch_size, config.MAX_GT_INSTANCES), dtype=np.int32)
-            batch_gt_end_rows = np.zeros((batch_size, config.MAX_GT_INSTANCES),
-                                         dtype=np.int32)
-            batch_gt_end_cols = np.zeros((batch_size, config.MAX_GT_INSTANCES),
-                                         dtype=np.int32)
-
-            if random_rois:
-                batch_rpn_rois = np.zeros((batch_size, rpn_rois.shape[0], 4),
-                                          dtype=rpn_rois.dtype)
-                if detection_targets:
-                    batch_rois = np.zeros((batch_size, ) + rois.shape,
-                                          dtype=rois.dtype)
-                    batch_mrcnn_class_ids = np.zeros(
-                        (batch_size, ) + mrcnn_class_ids.shape,
-                        dtype=mrcnn_class_ids.dtype)
-                    batch_mrcnn_bbox = np.zeros(
-                        (batch_size, ) + mrcnn_bbox.shape,
-                        dtype=mrcnn_bbox.dtype)
-                    batch_mrcnn_mask = np.zeros(
-                        (batch_size, ) + mrcnn_mask.shape,
-                        dtype=mrcnn_mask.dtype)
-
-        # If more instances than fits in the array, sub-sample from them.
-        if gt_boxes.shape[0] > config.MAX_GT_INSTANCES:
-            ids = np.random.choice(np.arange(gt_boxes.shape[0]),
-                                   config.MAX_GT_INSTANCES,
-                                   replace=False)
-            gt_class_ids = gt_class_ids[ids]
-            gt_boxes = gt_boxes[ids]
-            gt_start_rows = gt_start_rows[ids]
-            gt_start_cols = gt_start_cols[ids]
-            gt_end_rows = gt_end_rows[ids]
-            gt_end_cols = gt_end_cols[ids]
-            gt_masks = gt_masks[:, :, ids]
-        #print(image_meta)
-        print(gt_boxes[:, 0])
-        print(gt_start_rows)
-        print(gt_boxes[:, 1])
-        print(gt_start_cols)
-        print(gt_boxes[:, 2])
-        print(gt_end_rows)
-        print(gt_boxes[:, 3])
-        print(gt_end_cols)
-        # Add to batch
-        batch_image_meta[b] = image_meta
-        batch_rpn_match[b] = rpn_match[:, np.newaxis]
-        batch_rpn_bbox[b] = rpn_bbox
-        batch_images[b] = mold_image(image.astype(np.float32), config)
-        batch_gt_class_ids[b, :gt_class_ids.shape[0]] = gt_class_ids
-        batch_gt_start_rows[b, :gt_start_rows.shape[0]] = gt_start_rows
-        batch_gt_start_cols[b, :gt_start_cols.shape[0]] = gt_start_cols
-        batch_gt_end_rows[b, :gt_end_rows.shape[0]] = gt_end_rows
-        batch_gt_end_cols[b, :gt_end_cols.shape[0]] = gt_end_cols
-        batch_gt_boxes[b, :gt_boxes.shape[0]] = gt_boxes
-        batch_gt_masks[b, :, :, :gt_masks.shape[-1]] = gt_masks
-        if random_rois:
-            batch_rpn_rois[b] = rpn_rois
-            if detection_targets:
-                batch_rois[b] = rois
-                batch_mrcnn_class_ids[b] = mrcnn_class_ids
-                batch_mrcnn_bbox[b] = mrcnn_bbox
-                batch_mrcnn_mask[b] = mrcnn_mask
-        b += 1
-
-        # Batch full?
-        #print(batch_gt_start_rows)
-        if b >= batch_size:
-            inputs = [
-                batch_images, batch_image_meta, batch_rpn_match,
-                batch_rpn_bbox, batch_gt_class_ids, batch_gt_boxes,
-                batch_gt_start_rows, batch_gt_start_cols, batch_gt_end_rows,
-                batch_gt_end_cols, batch_gt_masks
-            ]
-            outputs = []
-
-            if random_rois:
-                inputs.extend([batch_rpn_rois])
-                if detection_targets:
-                    inputs.extend([batch_rois])
-                    # Keras requires that output and targets have the same number of dimensions
-                    batch_mrcnn_class_ids = np.expand_dims(
-                        batch_mrcnn_class_ids, -1)
-                    outputs.extend([
-                        batch_mrcnn_class_ids, batch_mrcnn_bbox,
-                        batch_mrcnn_mask
-                    ])
-
-            return inputs, outputs
-
-            # start a new batch
-            b = 0
-    except (GeneratorExit, KeyboardInterrupt):
-        raise
-    except:
-        # Log it and skip the image
-        logging.exception("Error processing image {}".format(
-            dataset.image_info[image_id]))
-        error_count += 1
-        if error_count > 5:
-            raise
-
-
-def prepare_graph_features_row(vertex_features,
-                               n_neighbours=40,
-                               n_dimensions=4,
-                               n_filters=42,
-                               n_propagate=18):
+def prepare_graph_features_row_old(vertex_features,
+                                   n_neighbours=40,
+                                   n_dimensions=4,
+                                   n_filters=42,
+                                   n_propagate=18):
     blocks = []
     all_features = vertex_features
     for i in range(4):
@@ -3225,16 +3013,17 @@ def prepare_graph_features_row(vertex_features,
     output_dense_0 = KL.Dense(256,
                               activation='relu',
                               name='row_graph_output_0')(all_features)
-    output_dense_1 = KL.Dense(32, activation='relu',
+    output_dense_1 = KL.Dense(128,
+                              activation='relu',
                               name='row_graph_output_1')(output_dense_0)
     return output_dense_1
 
 
-def prepare_graph_features_col(vertex_features,
-                               n_neighbours=40,
-                               n_dimensions=4,
-                               n_filters=42,
-                               n_propagate=18):
+def prepare_graph_features_col_old(vertex_features,
+                                   n_neighbours=40,
+                                   n_dimensions=4,
+                                   n_filters=42,
+                                   n_propagate=18):
     blocks = []
     all_features = vertex_features
     for i in range(4):
@@ -3267,18 +3056,284 @@ def prepare_graph_features_col(vertex_features,
     return output_dense_1
 
 
-def build_row_adj_classifier(graph_features):
-    net = KL.Dense(256, activation='relu',
-                   name='graph_row_dense_1')(graph_features)
+def edge_features(vertices_in, num_neighbors=10):
+    def euclidean_squared(A, B):
+        """
+        Returns euclidean distance between two batches of shape [B,N,F] and [B,M,F] where B is batch size, N is number of
+        examples in the batch of first set, M is number of examples in the batch of second set, F is number of spatial
+        features.
+        Returns:
+        A matrix of size [B, N, M] where each element [i,j] denotes euclidean distance between ith entry in first set and
+        jth in second set.
+        """
+
+        #shape_A = A.get_shape().as_list()
+        #shape_B = B.get_shape().as_list()
+
+        # assert (A.dtype == tf.float32 or A.dtype == tf.float64) and (
+        #    B.dtype == tf.float32 or B.dtype == tf.float64)
+        #assert len(shape_A) == 3 and len(shape_B) == 3
+        # assert shape_A[0] == shape_B[0]  # and shape_A[1] == shape_B[1]
+
+        # Finds euclidean distance using property (a-b)^2 = a^2 + b^2 - 2ab
+        sub_factor = -2 * \
+            tf.matmul(A, tf.transpose(B, perm=[0, 2, 1]))  # -2ab term
+        dotA = tf.expand_dims(tf.reduce_sum(A * A, axis=2), axis=2)  # a^2 term
+        dotB = tf.expand_dims(tf.reduce_sum(B * B, axis=2), axis=1)  # b^2 term
+        return tf.abs(sub_factor + dotA + dotB)
+
+    def nearest_neighbor_matrix(spatial_features, k=10):
+        """
+        Nearest neighbors matrix given spatial features.
+        :param spatial_features: Spatial features of shape [B, N, S] where B = batch size, N = max examples in batch,
+                                S = spatial features
+        :param k: Max neighbors
+        :return:
+        """
+
+        #shape = spatial_features.get_shape().as_list()
+
+        #assert spatial_features.dtype == tf.float32 or spatial_features.dtype == tf.float64
+        #assert len(shape) == 3
+
+        D = euclidean_squared(spatial_features, spatial_features)
+        D, N = tf.nn.top_k(-D, k)
+        return N, -D
+
+    def indexing_tensor(spatial_features, k=10, n_batch=-1):
+        shape_spatial_features = spatial_features.get_shape().as_list()
+        n_batch = shape_spatial_features[0]
+        n_max_entries = shape_spatial_features[1]
+
+        # All of these tensors should be 3-dimensional
+        assert len(shape_spatial_features) == 3
+
+        # Neighbor matrix should be int as it should be used for indexing
+        assert spatial_features.dtype == tf.float64 or spatial_features.dtype == tf.float32
+
+        neighbor_matrix, distance_matrix = nearest_neighbor_matrix(
+            spatial_features, k)
+
+        batch_range = tf.expand_dims(tf.expand_dims(tf.expand_dims(tf.range(
+            0, n_batch),
+                                                                   axis=1),
+                                                    axis=1),
+                                     axis=1)
+        batch_range = tf.tile(batch_range, [1, n_max_entries, k, 1])
+        expanded_neighbor_matrix = tf.expand_dims(neighbor_matrix, axis=3)
+
+        indexing_tensor = tf.concat([batch_range, expanded_neighbor_matrix],
+                                    axis=3)
+
+        return tf.cast(indexing_tensor, tf.int64), distance_matrix
+
+    trans_space = vertices_in
+    indexing, _ = indexing_tensor(trans_space, num_neighbors)
+    neighbour_space = tf.gather_nd(vertices_in, indexing)
+
+    expanded_trans_space = tf.expand_dims(trans_space, axis=2)
+    expanded_trans_space = tf.tile(expanded_trans_space,
+                                   [1, 1, num_neighbors, 1])
+    diff = expanded_trans_space - neighbour_space
+    edge = tf.concat([expanded_trans_space, diff], axis=-1)
+    return edge
+
+
+def edge_conv_layer_row(vertices_in,
+                        num_neighbors=30,
+                        mpl_layers=[128, 128, 128],
+                        aggregation_function=tf.reduce_max,
+                        edge_activation=None,
+                        layer_index=0):
+    edge = KL.Lambda(lambda x: edge_features(x, num_neighbors),
+                     name='graph_edge_conv_layer_' + str(layer_index + 1) +
+                     '_row')(vertices_in)
+    for i in range(len(mpl_layers)):
+        f = mpl_layers[i]
+        edge = KL.Dense(f,
+                        activation='relu',
+                        name='graph_edge_conv_layer_' + str(layer_index + 1) +
+                        '_row_dense_' + str(i + 1))(edge)
+    if edge_activation is not None:
+        edge = KL.Lambda(lambda x: edge_activation(x),
+                         name='graph_edge_conv_layer_' + str(layer_index + 1) +
+                         '_row_edge_activation')(edge)
+    vertex_out = KL.Lambda(lambda x: aggregation_function(x, axis=2),
+                           name='graph_edge_conv_layer_' +
+                           str(layer_index + 1) +
+                           '_row_edge_aggregation')(edge)
+    return vertex_out
+
+
+def edge_conv_layer_col(vertices_in,
+                        num_neighbors=30,
+                        mpl_layers=[128, 128, 128],
+                        aggregation_function=tf.reduce_max,
+                        edge_activation=None,
+                        layer_index=0):
+    edge = KL.Lambda(lambda x: edge_features(x, num_neighbors),
+                     name='graph_edge_conv_layer_' + str(layer_index + 1) +
+                     '_col')(vertices_in)
+    for i in range(len(mpl_layers)):
+        f = mpl_layers[i]
+        edge = KL.Dense(f,
+                        activation='relu',
+                        name='graph_edge_conv_layer_' + str(layer_index + 1) +
+                        '_col_dense_' + str(i + 1))(edge)
+    if edge_activation is not None:
+        edge = KL.Lambda(lambda x: edge_activation(x),
+                         name='graph_edge_conv_layer_' + str(layer_index + 1) +
+                         '_col_edge_activation')(edge)
+    vertex_out = KL.Lambda(lambda x: aggregation_function(x, axis=2),
+                           name='graph_edge_conv_layer_' +
+                           str(layer_index + 1) +
+                           '_col_edge_aggregation')(edge)
+    return vertex_out
+
+
+def high_dim_dense_row(inputs, nodes, layer_index=0):
+    if len(inputs.shape) == 3:
+        return KL.Conv1D(nodes,
+                         kernel_size=(1),
+                         strides=(1),
+                         padding='valid',
+                         name="graph_high_dim_layer_conv1d_row_" +
+                         str(layer_index + 1))(inputs)
+    if len(inputs.shape) == 4:
+        return KL.Conv2D(nodes,
+                         kernel_size=(1, 1),
+                         strides=(1, 1),
+                         padding='valid',
+                         name="graph_high_dim_layer_conv2d_row_" +
+                         str(layer_index + 1))(inputs)
+    if len(inputs.shape) == 5:
+        return KL.Conv3D(nodes,
+                         kernel_size=(1, 1, 1),
+                         strides=(1, 1, 1),
+                         padding='valid',
+                         name="graph_high_dim_layer_conv3d_row_" +
+                         str(layer_index + 1))(inputs)
+
+
+def high_dim_dense_col(inputs, nodes, layer_index=0):
+    if len(inputs.shape) == 3:
+        return KL.Conv1D(nodes,
+                         kernel_size=(1),
+                         strides=(1),
+                         padding='valid',
+                         name="graph_high_dim_layer_conv1d_col_" +
+                         str(layer_index + 1))(inputs)
+    if len(inputs.shape) == 4:
+        return KL.Conv2D(nodes,
+                         kernel_size=(1, 1),
+                         strides=(1, 1),
+                         padding='valid',
+                         name="graph_high_dim_layer_conv2d_col_" +
+                         str(layer_index + 1))(inputs)
+    if len(inputs.shape) == 5:
+        return KL.Conv3D(nodes,
+                         kernel_size=(1, 1, 1),
+                         strides=(1, 1, 1),
+                         padding='valid',
+                         name="graph_high_dim_layer_conv3d_col_" +
+                         str(layer_index + 1))(inputs)
+
+
+def prepare_graph_features_row(vertex_features, train_flag, num_neighbors=10):
+    feat = KL.BatchNormalization(
+        momentum=0.8, trainable=train_flag,
+        name='graph_feat_row_batch_norm')(vertex_features)
+    feat = high_dim_dense_row(feat, 128, 0)
+    feat = edge_conv_layer_row(feat,
+                               num_neighbors, [128, 128, 128],
+                               layer_index=0)
+    feat_g = GlobalExchange(name='graph_feat_row_global_exchange_1')(feat)
+    concatenated_feat = KL.Concatenate()([feat, feat_g])
+    feat = KL.Dense(128, activation='relu',
+                    name='graph_feat_row_dense_1')(concatenated_feat)
+    feat1 = edge_conv_layer_row(feat,
+                                num_neighbors, [128, 128, 128],
+                                layer_index=1)
+    feat1_g = GlobalExchange(name='graph_feat_row_global_exchange_2')(feat1)
+    concatenated_feat1 = KL.Concatenate()([feat1, feat1_g])
+    feat1 = KL.Dense(128, activation='relu',
+                     name='graph_feat_row_dense_2')(concatenated_feat1)
+    feat2 = edge_conv_layer_row(feat1,
+                                num_neighbors, [128, 128, 128],
+                                layer_index=2)
+    feat2_g = GlobalExchange(name='graph_feat_row_global_exchange_3')(feat2)
+    concatenated_feat2 = KL.Concatenate()([feat2, feat2_g])
+    feat2 = KL.Dense(128, activation='relu',
+                     name='graph_feat_row_dense_3')(concatenated_feat2)
+    feat3 = edge_conv_layer_row(feat2,
+                                num_neighbors, [128, 128, 128],
+                                layer_index=3)
+    feat = KL.Concatenate()(
+        [feat, feat1, feat2, feat_g, feat1_g, feat2_g, feat3])
+    feat = KL.Dense(256, activation='relu',
+                    name='graph_feat_row_dense_4')(feat)
+    feat = KL.Dense(256, activation='relu',
+                    name='graph_feat_row_dense_5')(feat)
+    return feat
+
+
+def prepare_graph_features_col(vertex_features, train_flag, num_neighbors=10):
+    feat = KL.BatchNormalization(
+        momentum=0.8, trainable=train_flag,
+        name='graph_feat_col_batch_norm')(vertex_features)
+    feat = high_dim_dense_col(feat, 128, 0)
+    feat = edge_conv_layer_col(feat,
+                               num_neighbors, [128, 128, 128],
+                               layer_index=0)
+    feat_g = GlobalExchange(name='graph_feat_col_global_exchange_1')(feat)
+    concatenated_feat = KL.Concatenate()([feat, feat_g])
+    feat = KL.Dense(128, activation='relu',
+                    name='graph_feat_col_dense_1')(concatenated_feat)
+    feat1 = edge_conv_layer_col(feat,
+                                num_neighbors, [128, 128, 128],
+                                layer_index=1)
+    feat1_g = GlobalExchange(name='graph_feat_col_global_exchange_2')(feat1)
+    concatenated_feat1 = KL.Concatenate()([feat1, feat1_g])
+    feat1 = KL.Dense(128, activation='relu',
+                     name='graph_feat_col_dense_2')(concatenated_feat1)
+    feat2 = edge_conv_layer_col(feat1,
+                                num_neighbors, [128, 128, 128],
+                                layer_index=2)
+    feat2_g = GlobalExchange(name='graph_feat_col_global_exchange_3')(feat2)
+    concatenated_feat2 = KL.Concatenate()([feat2, feat2_g])
+    feat2 = KL.Dense(128, activation='relu',
+                     name='graph_feat_col_dense_3')(concatenated_feat2)
+    feat3 = edge_conv_layer_col(feat2,
+                                num_neighbors, [128, 128, 128],
+                                layer_index=3)
+    feat = KL.Concatenate()(
+        [feat, feat1, feat2, feat_g, feat1_g, feat2_g, feat3])
+    feat = KL.Dense(256, activation='relu',
+                    name='graph_feat_col_dense_4')(feat)
+    feat = KL.Dense(256, activation='relu',
+                    name='graph_feat_col_dense_5')(feat)
+    return feat
+
+
+def build_row_adj_classifier(graph_features, train_flag):
+    net = KL.BatchNormalization(momentum=0.8,
+                                trainable=train_flag,
+                                name='graph_row_batch_norm')(graph_features)
+    net = KL.Dense(512, activation='relu', name='graph_row_dense_1')(net)
     net = KL.Dense(256, activation='relu', name='graph_row_dense_2')(net)
+    net = KL.Dense(256, activation='relu', name='graph_row_dense_3')(net)
     logits = KL.Dense(2, activation='relu', name='graph_row_dense_logits')(net)
     return logits
 
 
-def build_col_adj_classifier(graph_features):
-    net = KL.Dense(256, activation='relu',
-                   name='graph_col_dense_1')(graph_features)
+def build_col_adj_classifier(graph_features, train_flag):
+    net = KL.BatchNormalization(momentum=0.8,
+                                trainable=train_flag,
+                                name='graph_col_batch_norm')(graph_features)
+    print(net.shape)
+    net = KL.Dense(512, activation='relu', name='graph_col_dense_1')(net)
     net = KL.Dense(256, activation='relu', name='graph_col_dense_2')(net)
+    net = KL.Dense(256, activation='relu', name='graph_col_dense_3')(net)
     logits = KL.Dense(2, activation='relu', name='graph_col_dense_logits')(net)
     return logits
 
@@ -3350,7 +3405,7 @@ class MaskRCNN():
             gt_boxes = KL.Lambda(lambda x: norm_boxes_graph(
                 x,
                 K.shape(input_image)[1:3]))(input_gt_boxes)
-            #structural information
+            # structural information
             input_gt_start_rows = KL.Input(shape=[None],
                                            name="input_gt_start_rows",
                                            dtype=tf.int32)
@@ -3402,11 +3457,6 @@ class MaskRCNN():
         P3TD = KL.UpSampling2D(size=(2, 2), name="fpn_p4upsampled")(P4TD)
         P2TD = KL.UpSampling2D(size=(2, 2), name="fpn_p3upsampled")(P3TD)
 
-        #P5TD_gated = KL.multiply([P5TD, KL.Reshape((1, 1, config.TOP_DOWN_PYRAMID_SIZE))(KL.Dense(config.TOP_DOWN_PYRAMID_SIZE, name="gate_up_td_fpn_c5p5td")(KL.Dense(16, name="gate_down_td_fpn_c5p5td")(KL.GlobalAveragePooling2D()(P5TD))))])
-        #P4TD_gated = KL.multiply([P4TD, KL.Reshape((1, 1, config.TOP_DOWN_PYRAMID_SIZE))(KL.Dense(config.TOP_DOWN_PYRAMID_SIZE, name="gate_up_fpn_p5upsampled")(KL.Dense(16, name="gate_down_fpn_p5upsampled")(KL.GlobalAveragePooling2D()(P4TD))))])
-        #P3TD_gated = KL.multiply([P3TD, KL.Reshape((1, 1, config.TOP_DOWN_PYRAMID_SIZE))(KL.Dense(config.TOP_DOWN_PYRAMID_SIZE, name="gate_up_fpn_p4upsampled")(KL.Dense(16, name="gate_down_fpn_p4upsampled")(KL.GlobalAveragePooling2D()(P3TD))))])
-        #P2TD_gated = KL.multiply([P2TD, KL.Reshape((1, 1, config.TOP_DOWN_PYRAMID_SIZE))(KL.Dense(config.TOP_DOWN_PYRAMID_SIZE, name="gate_up_fpn_p3upsampled")(KL.Dense(16, name="gate_down_fpn_p3upsampled")(KL.GlobalAveragePooling2D()(P2TD))))])
-
         P2BU = KL.Conv2D(config.TOP_DOWN_PYRAMID_SIZE, (1, 1),
                          name='bu_fpn_c2p2bu')(C2)
         P3BU = KL.MaxPooling2D(pool_size=(2, 2), name='bu_fpn_p2bup3bu')(
@@ -3415,24 +3465,6 @@ class MaskRCNN():
             KL.Conv2D(config.TOP_DOWN_PYRAMID_SIZE, (1, 1), strides=1)(P3BU))
         P5BU = KL.MaxPooling2D(pool_size=(2, 2), name='bu_fpn_p4bup5bu')(
             KL.Conv2D(config.TOP_DOWN_PYRAMID_SIZE, (1, 1), strides=1)(P4BU))
-
-        #P5BU_gated = KL.multiply([P5BU, KL.Reshape((1, 1, config.TOP_DOWN_PYRAMID_SIZE))(KL.Dense(config.TOP_DOWN_PYRAMID_SIZE, name="gate_up_bu_fpn_p4bup5bu")(KL.Dense(16, name="gate_down_bu_fpn_p4bup5bu")(KL.GlobalAveragePooling2D()(P5BU))))])
-        #P4BU_gated = KL.multiply([P4BU, KL.Reshape((1, 1, config.TOP_DOWN_PYRAMID_SIZE))(KL.Dense(config.TOP_DOWN_PYRAMID_SIZE, name="gate_up_bu_fpn_p3bup4bu")(KL.Dense(16, name="gate_down_bu_fpn_p3bup4bu")(KL.GlobalAveragePooling2D()(P4BU))))])
-        #P3BU_gated = KL.multiply([P3BU, KL.Reshape((1, 1, config.TOP_DOWN_PYRAMID_SIZE))(KL.Dense(config.TOP_DOWN_PYRAMID_SIZE, name="gate_up_bu_fpn_p2bup3bu")(KL.Dense(16, name="gate_down_bu_fpn_p2bup3bu")(KL.GlobalAveragePooling2D()(P3BU))))])
-        #P2BU_gated = KL.multiply([P2BU, KL.Reshape((1, 1, config.TOP_DOWN_PYRAMID_SIZE))(KL.Dense(config.TOP_DOWN_PYRAMID_SIZE, name="gate_up_bu_fpn_c2p2bu")(KL.Dense(16, name="gate_down_bu_fpn_c2p2bu")(KL.GlobalAveragePooling2D()(P2BU))))])
-
-        #P5 = KL.Add(name="fpn_p5add")([
-        #    P5TD_gated,
-        #    P5BU_gated])
-        #P4 = KL.Add(name="fpn_p4add")([
-        #    P4TD_gated,
-        #    P4BU_gated])
-        #P3 = KL.Add(name="fpn_p3add")([
-        #    P3TD_gated,
-        #    P3BU_gated])
-        #P2 = KL.Add(name="fpn_p2add")([
-        #    P2TD_gated,
-        #    P2BU_gated])
 
         P5 = KL.Add(name="fpn_p5add")([P5TD, P5BU])
         P4 = KL.Add(name="fpn_p4add")([
@@ -3446,22 +3478,7 @@ class MaskRCNN():
                       name='fpn_c3p3')(C3), P3BU
         ])
         P2 = KL.Add(name="fpn_p2add")([P2TD, P2BU])
-        #print(tf.shape(P5))
-        #print(tf.shape(P4))
-        #print(tf.shape(P3))
-        #print(tf.shape(P2))
 
-        #P5 = KL.Conv2D(config.TOP_DOWN_PYRAMID_SIZE, (1, 1), name='fpn_c5p5')(C5)
-        #P4 = KL.Add(name="fpn_p4add")([
-        #    KL.UpSampling2D(size=(2, 2), name="fpn_p5upsampled")(P5),
-        #    KL.Conv2D(config.TOP_DOWN_PYRAMID_SIZE, (1, 1), name='fpn_c4p4')(C4)])
-        #P3 = KL.Add(name="fpn_p3add")([
-        #    KL.UpSampling2D(size=(2, 2), name="fpn_p4upsampled")(P4),
-        #    KL.Conv2D(config.TOP_DOWN_PYRAMID_SIZE, (1, 1), name='fpn_c3p3')(C3)])
-        #P2 = KL.Add(name="fpn_p2add")([
-        #    KL.UpSampling2D(size=(2, 2), name="fpn_p3upsampled")(P3),
-        #    KL.Conv2D(config.TOP_DOWN_PYRAMID_SIZE, (1, 1), name='fpn_c2p2')(C2)])
-        # Attach 3x3 conv to all P layers to get the final feature maps.
         P2 = KL.Conv2D(config.TOP_DOWN_PYRAMID_SIZE, (3, 3),
                        padding="SAME",
                        name="fpn_p2")(P2)
@@ -3567,57 +3584,98 @@ class MaskRCNN():
                                               config.NUM_CLASSES,
                                               train_bn=config.TRAIN_BN)
 
-            num_detected_boxes, detection_boxes, gt_boxes_denorm, detection_boxes_denorm, roi_gt_boxes, stuct_info, adj_rows, adj_cols, gathered_x_mid, gathered_y_mid = StructureDetectionLayer(
+            num_detected_boxes, predicted_flags, detection_boxes, gt_boxes_denorm, detection_boxes_denorm, roi_gt_boxes, stuct_info, adj_rows, adj_cols, gathered_x_mid_row, gathered_y_mid_row, gathered_x_mid_col, gathered_y_mid_col = StructureDetectionLayer(
                 config, name="mrcnn_detection")([
                     rois, mrcnn_class, mrcnn_bbox, input_image_meta,
                     input_gt_class_ids, gt_boxes, input_gt_start_rows,
                     input_gt_start_cols, input_gt_end_rows, input_gt_end_cols,
                     P2
                 ])
-            lstm_x_output = LSTMLayer(config, name="lstm_x")(gathered_x_mid)
-            lstm_y_output = LSTMLayer(config, name="lstm_y")(gathered_y_mid)
-            concatenated_lstm_output = KL.concatenate(
-                [lstm_x_output, lstm_y_output])
-            vertex_features = concatenated_lstm_output
-            vertex_features = KL.concatenate(
-                [vertex_features, detection_boxes_denorm])
+
+            lstm_x_output_row = KL.TimeDistributed(
+                KL.LSTM(config.LSTM_DEPTH),
+                name="lstm_row_x")(gathered_x_mid_row)
+            lstm_y_output_row = KL.TimeDistributed(
+                KL.LSTM(config.LSTM_DEPTH),
+                name="lstm_row_y")(gathered_y_mid_row)
+            lstm_x_output_col = KL.TimeDistributed(
+                KL.LSTM(config.LSTM_DEPTH),
+                name="lstm_col_x")(gathered_x_mid_col)
+            lstm_y_output_col = KL.TimeDistributed(
+                KL.LSTM(config.LSTM_DEPTH),
+                name="lstm_col_y")(gathered_y_mid_col)
+
+            # concatenated_lstm_output_row = KL.concatenate(
+            #     [lstm_x_output_row, lstm_y_output_row])
+            # concatenated_lstm_output_col = KL.concatenate(
+            #     [lstm_x_output_col, lstm_y_output_col])
+            # vertex_features_row = concatenated_lstm_output_row
+            # vertex_features_col = concatenated_lstm_output_col
+            vertex_features_row = lstm_y_output_row
+            vertex_features_col = lstm_x_output_col
+            vertex_features_row = KL.concatenate(
+                [vertex_features_row, detection_boxes_denorm])
+
+            vertex_features_col = KL.concatenate(
+                [vertex_features_col, detection_boxes_denorm])
             aggregate_vertex_features_row = prepare_graph_features_row(
-                vertex_features,
-                n_neighbours=config.GRAPH_NEIGHBORS,
-                n_dimensions=8,
-                n_filters=64,
-                n_propagate=32)
+                vertex_features_row,
+                True,
+                num_neighbors=config.GRAPH_NEIGHBORS)
+            # aggregate_vertex_features_row = prepare_graph_features_row(
+            #     vertex_features_row,
+            #     n_neighbours=config.GRAPH_NEIGHBORS,
+            #     n_dimensions=8,
+            #     n_filters=64,
+            #     n_propagate=32)
             aggregate_vertex_features_col = prepare_graph_features_col(
-                vertex_features,
-                n_neighbours=config.GRAPH_NEIGHBORS,
-                n_dimensions=8,
-                n_filters=64,
-                n_propagate=32)
-            graph_features_row = KL.Lambda(lambda x: KL.concatenate([
-                K.tile(K.expand_dims(x, 1),
-                       [1, config.TRAIN_ROIS_PER_IMAGE, 1, 1]),
-                K.tile(K.expand_dims(x, 2),
-                       [1, 1, config.TRAIN_ROIS_PER_IMAGE, 1])
-            ]))(aggregate_vertex_features_row)
-            graph_features_t_row = KL.Lambda(lambda x: K.permute_dimensions(
-                x, (0, 2, 1, 3)))(graph_features_row)
-            graph_features_row = KL.Lambda(
-                lambda x: KL.concatenate([x[0], x[1]]))(
-                    [graph_features_row, graph_features_t_row])
-            graph_features_col = KL.Lambda(lambda x: KL.concatenate([
-                K.tile(K.expand_dims(x, 1),
-                       [1, config.TRAIN_ROIS_PER_IMAGE, 1, 1]),
-                K.tile(K.expand_dims(x, 2),
-                       [1, 1, config.TRAIN_ROIS_PER_IMAGE, 1])
-            ]))(aggregate_vertex_features_col)
-            graph_features_t_col = KL.Lambda(lambda x: K.permute_dimensions(
-                x, (0, 2, 1, 3)))(graph_features_col)
-            graph_features_col = KL.Lambda(
-                lambda x: KL.concatenate([x[0], x[1]]))(
-                    [graph_features_col, graph_features_t_col])
-            #graph_features = KL.concatenate([K.tile(K.expand_dims(aggregate_vertex_features, 1), [1, config.TRAIN_ROIS_PER_IMAGE, 1, 1]), K.tile(K.expand_dims(aggregate_vertex_features, 2), [1, 1, config.TRAIN_ROIS_PER_IMAGE, 1])])
-            row_adj_logits = build_row_adj_classifier(graph_features_row)
-            col_adj_logits = build_col_adj_classifier(graph_features_col)
+                vertex_features_col,
+                True,
+                num_neighbors=config.GRAPH_NEIGHBORS)
+            # aggregate_vertex_features_col = prepare_graph_features_col(
+            #     vertex_features_col,
+            #     n_neighbours=config.GRAPH_NEIGHBORS,
+            #     n_dimensions=8,
+            #     n_filters=64,
+            #     n_propagate=32)
+
+            row_train_sample_indices = KL.Lambda(
+                lambda x: get_balanced_samples_for_training(*x, config),
+                name='row_train_gather')([adj_rows, predicted_flags])
+            col_train_sample_indices = KL.Lambda(
+                lambda x: get_balanced_samples_for_training(*x, config),
+                name='col_train_gather')([adj_cols, predicted_flags])
+
+            concatenated_features_row = KL.Lambda(
+                lambda x: generate_structure_classification_features(
+                    *x, True, config),
+                name='row_g')([
+                    aggregate_vertex_features_row, row_train_sample_indices,
+                    predicted_flags
+                ])
+
+            gathered_gt_row_matrix = KL.Lambda(
+                lambda x: generate_sampled_gt_matrix(*x, True, config),
+                name='row_gt')(
+                    [adj_rows, row_train_sample_indices, predicted_flags])
+
+            concatenated_features_col = KL.Lambda(
+                lambda x: generate_structure_classification_features(
+                    *x, True, config),
+                name='col_g')([
+                    aggregate_vertex_features_col, col_train_sample_indices,
+                    predicted_flags
+                ])
+
+            gathered_gt_col_matrix = KL.Lambda(
+                lambda x: generate_sampled_gt_matrix(*x, True, config),
+                name='col_gt')(
+                    [adj_cols, col_train_sample_indices, predicted_flags])
+
+            row_adj_logits = build_row_adj_classifier(
+                concatenated_features_row, True)
+            col_adj_logits = build_col_adj_classifier(
+                concatenated_features_col, True)
             output_rois = KL.Lambda(lambda x: x * 1, name="output_rois")(rois)
 
             # Losses
@@ -3652,13 +3710,13 @@ class MaskRCNN():
                 ])
             row_adj_loss = KL.Lambda(lambda x: adjacency_loss(*x),
                                      name="row_adj_loss")([
-                                         adj_rows, row_adj_logits,
-                                         num_detected_boxes
+                                         gathered_gt_row_matrix,
+                                         row_adj_logits, num_detected_boxes
                                      ])
             col_adj_loss = KL.Lambda(lambda x: adjacency_loss(*x),
                                      name="col_adj_loss")([
-                                         adj_cols, col_adj_logits,
-                                         num_detected_boxes
+                                         gathered_gt_col_matrix,
+                                         col_adj_logits, num_detected_boxes
                                      ])
 
             # Model
@@ -3676,7 +3734,7 @@ class MaskRCNN():
                 gt_boxes_denorm, detection_boxes_denorm, rpn_class_loss,
                 rpn_bbox_loss, class_loss, bbox_loss, mask_loss,
                 roi_alignment_loss, row_adj_logits, col_adj_logits,
-                row_adj_loss, col_adj_loss, concatenated_lstm_output
+                row_adj_loss, col_adj_loss
             ]
             model = KM.Model(inputs, outputs, name='mask_rcnn')
         else:
@@ -3691,54 +3749,82 @@ class MaskRCNN():
             # Detections
             # output is [batch, num_detections, (y1, x1, y2, x2, class_id, score)] in
             # normalized coordinates
-            detections, pred_boxes_denorm, gathered_x_mid, gathered_y_mid = DetectionLayer(
+            detection_flags, detections, pred_boxes_denorm, gathered_x_mid_row, gathered_y_mid_row, gathered_x_mid_col, gathered_y_mid_col, pseudo_gt_row_matrix, pseudo_gt_col_matrix = DetectionLayer(
                 config, name="mrcnn_detection")(
                     [rpn_rois, mrcnn_class, mrcnn_bbox, input_image_meta, P2])
-            lstm_x_output = LSTMLayer(config, name="lstm_x")(gathered_x_mid)
-            lstm_y_output = LSTMLayer(config, name="lstm_y")(gathered_y_mid)
-            concatenated_lstm_output = KL.concatenate(
-                [lstm_x_output, lstm_y_output])
-            vertex_features = concatenated_lstm_output
-            vertex_features = KL.concatenate(
-                [vertex_features, pred_boxes_denorm], axis=-1)
 
+            lstm_x_output_row = KL.TimeDistributed(
+                KL.LSTM(config.LSTM_DEPTH),
+                name="lstm_row_x")(gathered_x_mid_row)
+            lstm_y_output_row = KL.TimeDistributed(
+                KL.LSTM(config.LSTM_DEPTH),
+                name="lstm_row_y")(gathered_y_mid_row)
+            lstm_x_output_col = KL.TimeDistributed(
+                KL.LSTM(config.LSTM_DEPTH),
+                name="lstm_col_x")(gathered_x_mid_col)
+            lstm_y_output_col = KL.TimeDistributed(
+                KL.LSTM(config.LSTM_DEPTH),
+                name="lstm_col_y")(gathered_y_mid_col)
+            # concatenated_lstm_output_row = KL.concatenate(
+            #     [lstm_x_output_row, lstm_y_output_row])
+            # concatenated_lstm_output_col = KL.concatenate(
+            #     [lstm_x_output_col, lstm_y_output_col])
+            # vertex_features_row = concatenated_lstm_output_row
+            # vertex_features_col = concatenated_lstm_output_col
+            vertex_features_row = lstm_y_output_row
+            vertex_features_col = lstm_x_output_col
+            vertex_features_row = KL.concatenate(
+                [vertex_features_row, pred_boxes_denorm])
+            vertex_features_col = KL.concatenate(
+                [vertex_features_col, pred_boxes_denorm])
             aggregate_vertex_features_row = prepare_graph_features_row(
-                vertex_features,
-                n_neighbours=config.GRAPH_NEIGHBORS,
-                n_dimensions=8,
-                n_filters=64,
-                n_propagate=32)
+                vertex_features_row,
+                False,
+                num_neighbors=config.GRAPH_NEIGHBORS)
+            # aggregate_vertex_features_row = prepare_graph_features_row(
+            #     vertex_features_row,
+            #     n_neighbours=config.GRAPH_NEIGHBORS,
+            #     n_dimensions=8,
+            #     n_filters=64,
+            #     n_propagate=32)
             aggregate_vertex_features_col = prepare_graph_features_col(
-                vertex_features,
-                n_neighbours=config.GRAPH_NEIGHBORS,
-                n_dimensions=8,
-                n_filters=64,
-                n_propagate=32)
-            graph_features_row = KL.Lambda(lambda x: KL.concatenate([
-                K.tile(K.expand_dims(x, 1),
-                       [1, config.DETECTION_MAX_INSTANCES, 1, 1]),
-                K.tile(K.expand_dims(x, 2),
-                       [1, 1, config.DETECTION_MAX_INSTANCES, 1])
-            ]))(aggregate_vertex_features_row)
-            graph_features_t_row = KL.Lambda(lambda x: K.permute_dimensions(
-                x, (0, 2, 1, 3)))(graph_features_row)
-            graph_features_row = KL.Lambda(
-                lambda x: KL.concatenate([x[0], x[1]]))(
-                    [graph_features_row, graph_features_t_row])
-            graph_features_col = KL.Lambda(lambda x: KL.concatenate([
-                K.tile(K.expand_dims(x, 1),
-                       [1, config.DETECTION_MAX_INSTANCES, 1, 1]),
-                K.tile(K.expand_dims(x, 2),
-                       [1, 1, config.DETECTION_MAX_INSTANCES, 1])
-            ]))(aggregate_vertex_features_col)
-            graph_features_t_col = KL.Lambda(lambda x: K.permute_dimensions(
-                x, (0, 2, 1, 3)))(graph_features_col)
-            graph_features_col = KL.Lambda(
-                lambda x: KL.concatenate([x[0], x[1]]))(
-                    [graph_features_col, graph_features_t_col])
-            #graph_features = KL.concatenate([K.tile(K.expand_dims(aggregate_vertex_features, 1), [1, config.TRAIN_ROIS_PER_IMAGE, 1, 1]), K.tile(K.expand_dims(aggregate_vertex_features, 2), [1, 1, config.TRAIN_ROIS_PER_IMAGE, 1])])
-            row_adj_logits = build_row_adj_classifier(graph_features_row)
-            col_adj_logits = build_col_adj_classifier(graph_features_col)
+                vertex_features_col,
+                False,
+                num_neighbors=config.GRAPH_NEIGHBORS)
+            # aggregate_vertex_features_col = prepare_graph_features_col(
+            #     vertex_features_col,
+            #     n_neighbours=config.GRAPH_NEIGHBORS,
+            #     n_dimensions=8,
+            #     n_filters=64,
+            #     n_propagate=32)
+            print(aggregate_vertex_features_col.shape)
+            row_train_sample_indices = KL.Lambda(
+                lambda x: get_samples_for_testing(x, config),
+                name='row_test_train_gather')(pseudo_gt_row_matrix)
+            col_train_sample_indices = KL.Lambda(
+                lambda x: get_samples_for_testing(x, config),
+                name='col_test_train_gather')(pseudo_gt_col_matrix)
+
+            concatenated_features_row = KL.Lambda(
+                lambda x: generate_structure_classification_features(
+                    *x, False, config),
+                name='row_test_g')([
+                    aggregate_vertex_features_row, row_train_sample_indices,
+                    detection_flags
+                ])
+            print(concatenated_features_row.shape)
+            concatenated_features_col = KL.Lambda(
+                lambda x: generate_structure_classification_features(
+                    *x, False, config),
+                name='col_test_g')([
+                    aggregate_vertex_features_col, col_train_sample_indices,
+                    detection_flags
+                ])
+
+            row_adj_logits = build_row_adj_classifier(
+                concatenated_features_row, False)
+            col_adj_logits = build_col_adj_classifier(
+                concatenated_features_col, False)
 
             row_adj = KL.Lambda(lambda x: K.argmax(x),
                                 name="row_adj")(row_adj_logits)
@@ -3937,6 +4023,7 @@ class MaskRCNN():
                 continue
             # Is it trainable?
             trainable = bool(re.fullmatch(layer_regex, layer.name))
+            #print(layer.name, layer.weights, trainable)
             # Update layer. If layer is a container, update inner layer.
             if layer.__class__.__name__ == 'TimeDistributed':
                 layer.layer.trainable = trainable
@@ -4023,8 +4110,8 @@ class MaskRCNN():
                     imgaug.augmenters.Fliplr(0.5),
                     imgaug.augmenters.GaussianBlur(sigma=(0.0, 5.0))
                 ])
-	    custom_callbacks: Optional. Add custom callbacks to be called
-	        with the keras fit_generator method. Must be list of type keras.callbacks.
+            custom_callbacks: Optional. Add custom callbacks to be called
+                with the keras fit_generator method. Must be list of type keras.callbacks.
         no_augmentation_sources: Optional. List of sources to exclude for
             augmentation. A source is string that identifies a dataset and is
             defined in the Dataset class.
@@ -4035,14 +4122,14 @@ class MaskRCNN():
         layer_regex = {
             # all layers but the backbone
             "heads":
-            r"(mrcnn\_.*)|(rpn\_.*)|(fpn\_.*)|(gate\_.*)|(graph\_.*)|(row\_.*)|(col\_.*)",
+            r"(mrcnn\_.*)|(rpn\_.*)|(fpn\_.*)|(td\_.*)|(bu\_.*)|(gate\_.*)|(graph\_.*)|(row\_.*)|(col\_.*)|(lstm\_.*)",
             # From a specific Resnet stage and up
             "3+":
-            r"(res3.*)|(bn3.*)|(res4.*)|(bn4.*)|(res5.*)|(bn5.*)|(mrcnn\_.*)|(rpn\_.*)|(fpn\_.*)(td\_.*)|(bu\_.*)|(gate\_.*)|(graph\_.*)|(row\_.*)|(col\_.*)|(lstm\_.*)",
+            r"(res3.*)|(bn3.*)|(res4.*)|(bn4.*)|(res5.*)|(bn5.*)|(mrcnn\_.*)|(rpn\_.*)|(fpn\_.*)|(td\_.*)|(bu\_.*)|(gate\_.*)|(graph\_.*)|(row\_.*)|(col\_.*)|(lstm\_.*)",
             "4+":
-            r"(res4.*)|(bn4.*)|(res5.*)|(bn5.*)|(mrcnn\_.*)|(rpn\_.*)|(fpn\_.*)(td\_.*)|(bu\_.*)|(gate\_.*)|(graph\_.*)|(row\_.*)|(col\_.*)|(lstm\_.*)",
+            r"(res4.*)|(bn4.*)|(res5.*)|(bn5.*)|(mrcnn\_.*)|(rpn\_.*)|(fpn\_.*)|(td\_.*)|(bu\_.*)|(gate\_.*)|(graph\_.*)|(row\_.*)|(col\_.*)|(lstm\_.*)",
             "5+":
-            r"(res5.*)|(bn5.*)|(mrcnn\_.*)|(rpn\_.*)|(fpn\_.*)(td\_.*)|(bu\_.*)|(gate\_.*)|(graph\_.*)|(row\_.*)|(col\_.*)|(lstm\_.*)",
+            r"(res5.*)|(bn5.*)|(mrcnn\_.*)|(rpn\_.*)|(fpn\_.*)|(td\_.*)|(bu\_.*)|(gate\_.*)|(graph\_.*)|(row\_.*)|(col\_.*)|(lstm\_.*)",
             # All layers
             "all": ".*",
         }
@@ -4057,10 +4144,6 @@ class MaskRCNN():
             augmentation=augmentation,
             batch_size=self.config.BATCH_SIZE,
             no_augmentation_sources=no_augmentation_sources)
-        #x,y = generate_sample(train_dataset, self.config, shuffle=True,
-        #                                 augmentation=augmentation,
-        #                                 batch_size=self.config.BATCH_SIZE,
-        #                                 no_augmentation_sources=no_augmentation_sources)
 
         val_generator = data_generator(val_dataset,
                                        self.config,
@@ -4099,12 +4182,7 @@ class MaskRCNN():
         if os.name is 'nt':
             workers = 0
         else:
-            workers = 0  #25#multiprocessing.cpu_count()
-        #outputs = [self.keras_model.get_layer("roi_alignment_loss").output]
-        #functor = K.function([self.keras_model.inputs, K.learning_phase()], outputs)
-        #layer_outs = functor(*x)
-        #print(layer_outs)
-        #preds = self.keras_model.predict(x)
+            workers = 0  # 25#multiprocessing.cpu_count()
 
         self.keras_model.fit_generator(
             train_generator,
@@ -4114,22 +4192,11 @@ class MaskRCNN():
             callbacks=callbacks,
             validation_data=val_generator,
             validation_steps=self.config.VALIDATION_STEPS,
-            max_queue_size=100,  #25
+            max_queue_size=100,  # 25
             workers=workers,
             use_multiprocessing=False,
         )
-        #preds = self.keras_model.predict(x)
-        #print(preds[16])
-        #print(preds[17])
-        #print(preds[18])
-        #print(preds[19])
-        #print(preds[19].shape)
-        #print(preds[20])
-        #print(preds[20].shape)
-        #print(preds[21])
-        #print(preds[21].shape)
-        #print(preds[22])
-        #print(preds[23])
+
         self.epoch = max(self.epoch, epochs)
 
     def mold_inputs(self, images):
@@ -4287,7 +4354,8 @@ class MaskRCNN():
             log("anchors", anchors)
         # Run object detection
         detections, _, _, mrcnn_mask, _, _, _, row_adj, col_adj =\
-            self.keras_model.predict([molded_images, image_metas, anchors], verbose=0)
+            self.keras_model.predict(
+                [molded_images, image_metas, anchors], verbose=0)
         # Process detections
         results = []
         for i, image in enumerate(images):
@@ -4347,7 +4415,8 @@ class MaskRCNN():
             log("anchors", anchors)
         # Run object detection
         detections, _, _, mrcnn_mask, _, _, _ =\
-            self.keras_model.predict([molded_images, image_metas, anchors], verbose=0)
+            self.keras_model.predict(
+                [molded_images, image_metas, anchors], verbose=0)
         # Process detections
         results = []
         for i, image in enumerate(molded_images):
