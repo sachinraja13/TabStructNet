@@ -1,2 +1,5 @@
-Please add the models (mask_rcnn_tab_.h5) files into this folder.
+Please add the model (mask_rcnn_tab_0100.h5) file trained on SciTSR into this folder.
 Link to download: https://drive.google.com/drive/folders/1DRFbOW5FSl4A73wgw5i9O0JKkRegyO6-?usp=sharing
+
+Please add the model (mask_rcnn_tab_0120.h5) file trained on SciTSR and fine-tuned on UNLV partial dataset into this folder.
+Link to download: https://drive.google.com/drive/folders/1t5Io8q_g9MkM2KyYXG3s9b0NOVo3RIDw?usp=sharing
