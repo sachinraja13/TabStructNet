@@ -1,0 +1,1 @@
+Four corresponding folders for each result folder with renamed files are generated here. Please use these folders in the xml generating postprocessing module.

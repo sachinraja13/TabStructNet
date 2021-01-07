@@ -1,0 +1,1 @@
+Please copy the four result folders generated from the TabStructNet model here for renaming the index files.

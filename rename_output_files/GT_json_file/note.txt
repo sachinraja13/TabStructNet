@@ -1,0 +1,1 @@
+Please copy the validation JSON file from the annotations folder of TabStructNet dataset used into this folder. This is used for identifying original name from generated indexes.
