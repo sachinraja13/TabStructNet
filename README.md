@@ -33,13 +33,13 @@ UNLV train and test split is added in the repository for easy fine-tuning on UNL
 
 ```
 To generate output XML:
-Execute the TabStructNet model for evaluation as specified in the repository's README.
-Copy the 4 result folders generated in the trained_model/tab directory to the results folder inside the rename_output_files folder.
-Execute rename_maskrcnn_result_files.py
-Copy the 4 result folders generated inside rename_output_files/rename_results to xml_generating_postprocessor directory.
-Copy the validation JPEG images inside xml_generating_postprocessor/gt_without_box folder.
-Execute cell_postprocessor_adj.py 
-XMLs are generated in processed_xmls folder,
+1. Execute the TabStructNet model for evaluation as specified in the repository's README.
+2. Copy the 4 result folders generated in the trained_model/tab directory to the results folder inside the rename_output_files folder.
+3. Execute rename_maskrcnn_result_files.py
+4. Copy the 4 result folders generated inside rename_output_files/rename_results to xml_generating_postprocessor directory.
+5. Copy the validation JPEG images inside xml_generating_postprocessor/gt_without_box folder.
+6. Execute cell_postprocessor_adj.py 
+XMLs are generated in processed_xmls folder.
 ```
 
 ##### Please refer to https://github.com/matterport/Mask_RCNN initially for any issues in running the script.
