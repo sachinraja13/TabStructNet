@@ -267,7 +267,7 @@ def main():
                 if start_col_assignments[i] > end_col_assignments[i]:
                     end_col_assignments[i] = start_col_assignments[i]
                 table_details.append([
-                    False, start_col_assignments[i], start_col_assignments[i],
+                    False, start_row_assignments[i], start_col_assignments[i],
                     end_row_assignments[i], end_col_assignments[i],
                     table_cells[i][0], table_cells[i][1], table_cells[i][2],
                     table_cells[i][3]
