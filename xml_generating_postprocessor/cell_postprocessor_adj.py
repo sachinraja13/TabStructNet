@@ -5,10 +5,11 @@ import pickle
 from PIL import ImageFilter, Image
 import os
 import os.path
-import xml.etree.cElementTree as ET
+# import xml.etree.cElementTree as ET
 import xml.etree.ElementTree as ET
 import operator
-
+import pytesseract
+import re
 from numpy.core.fromnumeric import sort
 
 text_read_path = 'result_text/'
@@ -58,6 +59,108 @@ def read_text_file(read_text_path, min_score=0.8):
     return table_cells, skipped_indices
 
 
+def remove_overlaps(cells,
+                    overlapping_area_pct_threshold=0.2,
+                    removed_indices=[]):
+    import intervaltree
+    removed_flag = False
+    x_interval_tree = intervaltree.IntervalTree()
+    y_interval_tree = intervaltree.IntervalTree()
+    for i in range(len(cells)):
+        bbox = cells[i]
+        x1 = bbox[0]
+        y1 = bbox[1]
+        x2 = bbox[2]
+        y2 = bbox[3]
+        y_interval_tree[y1:y2] = i
+        x_interval_tree[x1:x2] = i
+    for i in range(len(cells)):
+        cell = cells[i]
+        if i in removed_indices:
+            continue
+        x1, y1, x2, y2 = cell
+        y_overlapping_cells = set(
+            [j.data for j in y_interval_tree[y1:y2] if j.data != i])
+        x_overlapping_cells = set(
+            [j.data for j in x_interval_tree[x1:x2] if j.data != i])
+        overlapping_cells = x_overlapping_cells | y_overlapping_cells
+        overlapping_count = 0
+        for overlapping_cell_index in overlapping_cells:
+            if overlapping_cell_index in removed_indices:
+                continue
+            overlapping_cell = cells[overlapping_cell_index]
+            ox1, oy1, ox2, oy2 = overlapping_cell
+            cell_area = (y2 - y1) * (x2 - x1)
+            overlapping_cell_area = (oy2 - oy1) * (ox2 - ox1)
+            overlapping_area = max(
+                (min(oy2, y2) - max(oy1, y1)) * (min(ox2, x2) - max(ox1, x1)),
+                0)
+            overlapping_pct = overlapping_area / min(cell_area,
+                                                     overlapping_cell_area)
+            if overlapping_pct >= overlapping_area_pct_threshold:
+                overlapping_count = overlapping_count + 1
+        if overlapping_count > 2 and i not in removed_indices:
+            removed_indices.append(i)
+            removed_flag = True
+    return removed_indices, removed_flag
+
+
+def recursively_remove_overlaps(cells, overlapping_area_pct_threshold=0.2):
+    removed_indices = []
+    removed_flag = True
+    while removed_flag == True:
+        removed_indices, removed_flag = remove_overlaps(
+            cells,
+            overlapping_area_pct_threshold=overlapping_area_pct_threshold,
+            removed_indices=removed_indices)
+    return removed_indices
+
+
+def remove_extra_indices(indices_list):
+    def create_indices_dict(indices_list):
+        indices_dict = {}
+        for assignment in indices_list:
+            for index in assignment:
+                if index not in indices_dict:
+                    indices_dict[index] = []
+                other_assignment_set = set(
+                    [x for x in assignment if x != index])
+                indices_dict[index].append(other_assignment_set)
+        return indices_dict
+
+    def remove_extra(indices_list, remove_index):
+        indices = []
+        for assignment in indices_list:
+            new_assignment = []
+            for index in assignment:
+                if index == remove_index:
+                    continue
+                elif index > remove_index:
+                    new_assignment.append(index - 1)
+                else:
+                    new_assignment.append(index)
+            indices.append(new_assignment)
+        return indices
+
+    # print(indices_list)
+    while True > 0:
+        indices_dict = create_indices_dict(indices_list)
+        remove_indices = []
+        for i in indices_dict:
+            redundant_indices = list(set.intersection(*indices_dict[i]))
+            # print(i, indices_dict[i], redundant_indices)
+            if len(redundant_indices) > 0:
+                remove_indices.append(i)
+        remove_indices = list(set(remove_indices))
+        remove_indices = sorted(remove_indices)
+        # print(indices_list, remove_indices)
+        if len(remove_indices) > 0:
+            indices_list = remove_extra(indices_list, remove_indices[0])
+        else:
+            break
+    return indices_list
+
+
 def get_column_structure_indices(adj, coordinates):
     def get_x_overlap_and_containment(cell1, cell2):
         overlap = float(min(cell1[2], cell2[2]) -
@@ -80,25 +183,29 @@ def get_column_structure_indices(adj, coordinates):
         column_indexes.append([])
     cur_col_index = -1
     prev_index = sorted_indices_end_x[0]
+
     for i in sorted_indices_end_x:
         overlap_i_prev, containment_i_prev = get_x_overlap_and_containment(
             coordinates[i], coordinates[prev_index])
         adj_i_prev = max(adj[i, prev_index], adj[prev_index, i])
-        if (adj_i_prev == 0 and overlap_i_prev < 0.75) or (
-                adj_i_prev == 1
-                and overlap_i_prev < 0.25) or cur_col_index == -1:
+        if (adj_i_prev == 0 and
+            (overlap_i_prev < 0.75 or containment_i_prev < 0.8)) or (
+                adj_i_prev == 1 and
+                (overlap_i_prev < 0.6
+                 or containment_i_prev < 0.7)) or cur_col_index == -1:
             cur_col_index += 1
             for j in sorted_indices_start_x:
                 overlap_i_j, containment_i_j = get_x_overlap_and_containment(
                     coordinates[i], coordinates[j])
                 adj_i_j = max(adj[i, j], adj[j, i])
                 if adj_i_j == 1 and (overlap_i_j >= 0.2
-                                     or containment_i_j >= 0.5):
+                                     or containment_i_j >= 0.6):
                     column_indexes[j].append(cur_col_index)
                 elif adj_i_j == 0 and (overlap_i_j >= 0.25
-                                       or containment_i_j >= 0.75):
+                                       or containment_i_j >= 0.8):
                     column_indexes[j].append(cur_col_index)
         prev_index = i
+    column_indexes = remove_extra_indices(column_indexes)
     start_column_indices = []
     end_column_indices = []
     skipped = []
@@ -110,7 +217,8 @@ def get_column_structure_indices(adj, coordinates):
             continue
         start_column_indices.append(min(column_indexes[i]))
         end_column_indices.append(max(column_indexes[i]))
-    print("Num columns identified: " + str(cur_col_index))
+    print("Num columns identified: " +
+          str(max(max(x) for x in column_indexes if len(x) > 0) + 1))
     print("Num skipped: " + str(len(skipped)))
     return start_column_indices, end_column_indices
 
@@ -141,10 +249,13 @@ def get_row_structure_indices(adj, coordinates):
         overlap_i_prev, containment_i_prev = get_y_overlap_and_containment(
             coordinates[i], coordinates[prev_index])
         adj_i_prev = max(adj[i, prev_index], adj[prev_index, i])
-        if (adj_i_prev == 0 and overlap_i_prev < 0.75) or (
-                adj_i_prev == 1
-                and overlap_i_prev < 0.4) or cur_row_index == -1:
+        if (adj_i_prev == 0 and
+            (overlap_i_prev < 0.75 or containment_i_prev < 0.8)) or (
+                adj_i_prev == 1 and
+                (overlap_i_prev < 0.6
+                 or containment_i_prev < 0.7)) or cur_row_index == -1:
             cur_row_index += 1
+            # print(i, prev_index, adj_i_prev, overlap_i_prev, containment_i_prev, cur_row_index)
             for j in sorted_indices_start_y:
                 overlap_i_j, containment_i_j = get_y_overlap_and_containment(
                     coordinates[i], coordinates[j])
@@ -159,6 +270,7 @@ def get_row_structure_indices(adj, coordinates):
     start_row_indices = []
     end_row_indices = []
     skipped = []
+    row_indexes = remove_extra_indices(row_indexes)
     for i in range(len(row_indexes)):
         if len(row_indexes[i]) == 0:
             start_row_indices.append(-1)
@@ -167,7 +279,8 @@ def get_row_structure_indices(adj, coordinates):
             continue
         start_row_indices.append(min(row_indexes[i]))
         end_row_indices.append(max(row_indexes[i]))
-    print("Num rows identified: " + str(cur_row_index))
+    print("Num rows identified: " +
+          str(max(max(x) for x in row_indexes if len(x) > 0) + 1))
     print("Num skipped: " + str(len(skipped)))
     return start_row_indices, end_row_indices
 
@@ -196,7 +309,11 @@ def create_root(image_path, file_prefix, width, height, depth):
     return root
 
 
-def create_cell_annotation(root, table_details, table_information):
+def create_cell_annotation(root,
+                           table_details,
+                           table_information,
+                           img,
+                           add_content=True):
     obj = ET.SubElement(root, "object")
     ET.SubElement(obj, "name").text = "table"
     ET.SubElement(obj, "pose").text = "Unspecified"
@@ -217,6 +334,14 @@ def create_cell_annotation(root, table_details, table_information):
         ET.SubElement(cell, "end_row").text = str(cell_detail[3])
         ET.SubElement(cell, "start_col").text = str(cell_detail[2])
         ET.SubElement(cell, "start_row").text = str(cell_detail[1])
+        if add_content:
+            cell_img = Image.fromarray(
+                img[cell_detail[6]:cell_detail[8] + 1,
+                    cell_detail[5]:cell_detail[7] + 1, :])
+            cell_content = str(
+                pytesseract.image_to_string(cell_img, lang='eng')).strip()
+            cell_content = re.sub(r'[^a-zA-Z0-9 ]', r'', cell_content)
+            ET.SubElement(cell, "content").text = str(cell_content)
         ET.SubElement(cell, "x0").text = str(cell_detail[5])
         ET.SubElement(cell, "x1").text = str(cell_detail[7])
         ET.SubElement(cell, "y0").text = str(cell_detail[6])
@@ -229,10 +354,14 @@ def main():
     for text_file in os.listdir(text_read_path):
         if text_file.endswith('txt'):
             file_prefix = text_file.replace(".txt", "")
-            img_read_path = image_read_path + file_prefix + ".jpg"
+            # if file_prefix != 'failure_1_1806.04265v1.5':
+            #     continue
+            img_read_path = image_read_path + file_prefix + ".png"
             img_write_path = image_write_path + file_prefix + ".jpg"
             read_text_path = text_read_path + text_file
             table_cells, skipped_indices = read_text_file(read_text_path)
+            removed_indices = recursively_remove_overlaps(
+                table_cells, overlapping_area_pct_threshold=0.2)
             row_adj = pickle.load(
                 open(row_pkl_read_path + file_prefix + ".pkl", 'rb'))
             col_adj = pickle.load(
@@ -241,6 +370,11 @@ def main():
             row_adj = np.delete(row_adj, skipped_indices, axis=1)
             col_adj = np.delete(col_adj, skipped_indices, axis=0)
             col_adj = np.delete(col_adj, skipped_indices, axis=1)
+            table_cells = np.delete(table_cells, removed_indices, axis=0)
+            row_adj = np.delete(row_adj, removed_indices, axis=0)
+            row_adj = np.delete(row_adj, removed_indices, axis=1)
+            col_adj = np.delete(col_adj, removed_indices, axis=0)
+            col_adj = np.delete(col_adj, removed_indices, axis=1)
             x_starts = np.asarray(table_cells)[:, 0]
             x_ends = np.asarray(table_cells)[:, 2]
             print("*******")
@@ -279,7 +413,7 @@ def main():
                 #     str(start_col_assignments[i]) + "\t" +
                 #     str(end_col_assignments[i]))
             root = create_cell_annotation(root, table_details,
-                                          table_information)
+                                          table_information, img)
             tree = ET.ElementTree(root)
             xml_file_path = xml_output_path + file_prefix + ".xml"
             tree.write(xml_file_path)
