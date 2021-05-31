@@ -60,12 +60,11 @@ def read_text_file(read_text_path, min_score=0.8):
 
 
 def remove_overlaps(cells,
-                    overlapping_area_pct_threshold=0.2,
+                    overlapping_area_pct_threshold=0.25,
                     removed_indices=[]):
-    import intervaltree
     removed_flag = False
-    x_interval_tree = intervaltree.IntervalTree()
-    y_interval_tree = intervaltree.IntervalTree()
+    x_interval_tree = IntervalTree()
+    y_interval_tree = IntervalTree()
     for i in range(len(cells)):
         bbox = cells[i]
         x1 = bbox[0]
@@ -83,7 +82,7 @@ def remove_overlaps(cells,
             [j.data for j in y_interval_tree[y1:y2] if j.data != i])
         x_overlapping_cells = set(
             [j.data for j in x_interval_tree[x1:x2] if j.data != i])
-        overlapping_cells = x_overlapping_cells | y_overlapping_cells
+        overlapping_cells = x_overlapping_cells & y_overlapping_cells
         overlapping_count = 0
         for overlapping_cell_index in overlapping_cells:
             if overlapping_cell_index in removed_indices:
@@ -99,19 +98,124 @@ def remove_overlaps(cells,
                                                      overlapping_cell_area)
             if overlapping_pct >= overlapping_area_pct_threshold:
                 overlapping_count = overlapping_count + 1
-        if overlapping_count > 2 and i not in removed_indices:
+        if overlapping_count >= 2 and i not in removed_indices:
             removed_indices.append(i)
             removed_flag = True
     return removed_indices, removed_flag
 
 
-def recursively_remove_overlaps(cells, overlapping_area_pct_threshold=0.2):
-    removed_indices = []
+def recursively_remove_overlaps(cells,
+                                overlapping_area_pct_threshold=0.25,
+                                removed_indices=[]):
     removed_flag = True
     while removed_flag == True:
         removed_indices, removed_flag = remove_overlaps(
             cells,
             overlapping_area_pct_threshold=overlapping_area_pct_threshold,
+            removed_indices=removed_indices)
+    return removed_indices
+
+
+def remove_columnwise_unaligned_cells(cells,
+                                      containment_region_pct_threshold=0.7,
+                                      removed_indices=[]):
+    removed_flag = False
+    x_interval_tree = IntervalTree()
+    for i in range(len(cells)):
+        if i in removed_indices:
+            continue
+        bbox = cells[i]
+        x1 = bbox[0]
+        x2 = bbox[2]
+        x_interval_tree[x1:x2] = i
+    for i in range(len(cells)):
+        cell = cells[i]
+        if i in removed_indices:
+            continue
+        x1, y1, x2, y2 = cell
+        overlapping_cells = set(
+            [j.data for j in x_interval_tree[x1:x2] if j.data != i])
+        containment_count = 0
+        denominator_containment_count = 0
+        for overlapping_cell_index in overlapping_cells:
+            if overlapping_cell_index in removed_indices:
+                continue
+            overlapping_cell = cells[overlapping_cell_index]
+            ox1, oy1, ox2, oy2 = overlapping_cell
+            containment = float(min(x2, ox2) - max(x1, ox1)) / float(
+                min(x2 - x1, ox2 - ox1))
+            containment = max(0, containment)
+            if containment >= containment_region_pct_threshold:
+                containment_count = containment_count + 1
+            if containment >= 0.2:
+                denominator_containment_count = denominator_containment_count + 1
+        if denominator_containment_count >= 2 and containment_count < int(
+                0.34 *
+            (denominator_containment_count + 1)) and i not in removed_indices:
+            removed_indices.append(i)
+            removed_flag = True
+    return removed_indices, removed_flag
+
+
+def recursively_remove_columnwise_unaligned_cells(
+        cells, containment_region_pct_threshold=0.7, removed_indices=[]):
+    removed_flag = True
+    while removed_flag == True:
+        removed_indices, removed_flag = remove_columnwise_unaligned_cells(
+            cells,
+            containment_region_pct_threshold=containment_region_pct_threshold,
+            removed_indices=removed_indices)
+    return removed_indices
+
+
+def remove_rowwise_unaligned_cells(cells,
+                                   containment_region_pct_threshold=0.7,
+                                   removed_indices=[]):
+    removed_flag = False
+    y_interval_tree = IntervalTree()
+    for i in range(len(cells)):
+        if i in removed_indices:
+            continue
+        bbox = cells[i]
+        y1 = bbox[1]
+        y2 = bbox[3]
+        y_interval_tree[y1:y2] = i
+    for i in range(len(cells)):
+        cell = cells[i]
+        if i in removed_indices:
+            continue
+        x1, y1, x2, y2 = cell
+        overlapping_cells = set(
+            [j.data for j in y_interval_tree[y1:y2] if j.data != i])
+        containment_count = 0
+        denominator_containment_count = 0
+        for overlapping_cell_index in overlapping_cells:
+            if overlapping_cell_index in removed_indices:
+                continue
+            overlapping_cell = cells[overlapping_cell_index]
+            ox1, oy1, ox2, oy2 = overlapping_cell
+            containment = float(min(y2, oy2) - max(y1, oy1)) / float(
+                min(y2 - y1, oy2 - oy1))
+            containment = max(0, containment)
+            if containment >= containment_region_pct_threshold:
+                containment_count = containment_count + 1
+            if containment >= 0.2:
+                denominator_containment_count = denominator_containment_count + 1
+        if denominator_containment_count >= 2 and containment_count < int(
+                0.34 *
+            (denominator_containment_count + 1)) and i not in removed_indices:
+            removed_indices.append(i)
+            removed_flag = True
+    return removed_indices, removed_flag
+
+
+def recursively_remove_rowwise_unaligned_cells(
+        cells, containment_region_pct_threshold=0.7, removed_indices=[]):
+    removed_flag = True
+    while removed_flag == True:
+        removed_indices, removed_flag = remove_rowwise_unaligned_cells(
+            cells,
+            containment_region_pct_threshold=containment_region_pct_threshold,
             removed_indices=removed_indices)
     return removed_indices
 
@@ -175,36 +279,46 @@ def get_column_structure_indices(adj, coordinates):
     sorted_indices_end_x = np.argsort(coordinates.view('i8,i8,i8,i8'),
                                       order=['f2', 'f0', 'f1'],
                                       axis=0)[:, 0]
-    sorted_indices_start_x = np.argsort(coordinates.view('i8,i8,i8,i8'),
-                                        order=['f0', 'f2', 'f1'],
-                                        axis=0)[:, 0]
+
     column_indexes = []
     for i in range(len(coordinates)):
-        column_indexes.append([])
+        column_indexes.append(set())
     cur_col_index = -1
-    prev_index = sorted_indices_end_x[0]
 
+    x_interval_tree = IntervalTree()
+    for index in sorted_indices_end_x:
+        x1, y1, x2, y2 = coordinates[index]
+        x_interval_tree[x1:x2] = index
     for i in sorted_indices_end_x:
-        overlap_i_prev, containment_i_prev = get_x_overlap_and_containment(
-            coordinates[i], coordinates[prev_index])
-        adj_i_prev = max(adj[i, prev_index], adj[prev_index, i])
-        if (adj_i_prev == 0 and
-            (overlap_i_prev < 0.75 or containment_i_prev < 0.8)) or (
-                adj_i_prev == 1 and
-                (overlap_i_prev < 0.6
-                 or containment_i_prev < 0.7)) or cur_col_index == -1:
-            cur_col_index += 1
-            for j in sorted_indices_start_x:
-                overlap_i_j, containment_i_j = get_x_overlap_and_containment(
-                    coordinates[i], coordinates[j])
-                adj_i_j = max(adj[i, j], adj[j, i])
-                if adj_i_j == 1 and (overlap_i_j >= 0.2
-                                     or containment_i_j >= 0.6):
-                    column_indexes[j].append(cur_col_index)
-                elif adj_i_j == 0 and (overlap_i_j >= 0.25
-                                       or containment_i_j >= 0.8):
-                    column_indexes[j].append(cur_col_index)
-        prev_index = i
+        #include cell itself in it's overlaps
+        x1, y1, x2, y2 = coordinates[i]
+        x_overlapping_cells = set([j.data for j in x_interval_tree[x1:x2]])
+        condition_meeting_overlapping_cells = []
+        for j in x_overlapping_cells:
+            overlap_i_j, containment_i_j = get_x_overlap_and_containment(
+                coordinates[i], coordinates[j])
+            adj_i_j = max(adj[i, j], adj[j, i])
+            if adj_i_j == 1 and (overlap_i_j >= 0.2 or containment_i_j >= 0.7):
+                condition_meeting_overlapping_cells.append(j)
+
+            elif adj_i_j == 0 and (overlap_i_j >= 0.25
+                                   or containment_i_j >= 0.8):
+                condition_meeting_overlapping_cells.append(j)
+        column_indexes_np = np.array(column_indexes)
+
+        if len(column_indexes[i]) > 2:
+            continue
+        num_common_assigned_indices = len(
+            set.intersection(
+                *column_indexes_np[condition_meeting_overlapping_cells]))
+        # print(i, x_overlapping_cells, condition_meeting_overlapping_cells,
+        #       num_common_assigned_indices)
+        if num_common_assigned_indices > 0:
+            continue
+        cur_col_index += 1
+        # print(cur_col_index)
+        for j in condition_meeting_overlapping_cells:
+            column_indexes[j].add(cur_col_index)
     column_indexes = remove_extra_indices(column_indexes)
     start_column_indices = []
     end_column_indices = []
@@ -217,6 +331,7 @@ def get_column_structure_indices(adj, coordinates):
             continue
         start_column_indices.append(min(column_indexes[i]))
         end_column_indices.append(max(column_indexes[i]))
+    # print(column_indexes)
     print("Num columns identified: " +
           str(max(max(x) for x in column_indexes if len(x) > 0) + 1))
     print("Num skipped: " + str(len(skipped)))
@@ -237,36 +352,50 @@ def get_row_structure_indices(adj, coordinates):
     sorted_indices_end_y = np.argsort(coordinates.view('i8,i8,i8,i8'),
                                       order=['f3', 'f1', 'f0'],
                                       axis=0)[:, 0]
-    sorted_indices_start_y = np.argsort(coordinates.view('i8,i8,i8,i8'),
-                                        order=['f1', 'f3', 'f0'],
-                                        axis=0)[:, 0]
+
     row_indexes = []
     for i in range(len(coordinates)):
-        row_indexes.append([])
+        row_indexes.append(set())
     cur_row_index = -1
-    prev_index = sorted_indices_end_y[0]
+
+    y_interval_tree = IntervalTree()
+    for index in sorted_indices_end_y:
+        x1, y1, x2, y2 = coordinates[index]
+        y_interval_tree[y1:y2] = index
+
     for i in sorted_indices_end_y:
-        overlap_i_prev, containment_i_prev = get_y_overlap_and_containment(
-            coordinates[i], coordinates[prev_index])
-        adj_i_prev = max(adj[i, prev_index], adj[prev_index, i])
-        if (adj_i_prev == 0 and
-            (overlap_i_prev < 0.75 or containment_i_prev < 0.8)) or (
-                adj_i_prev == 1 and
-                (overlap_i_prev < 0.6
-                 or containment_i_prev < 0.7)) or cur_row_index == -1:
-            cur_row_index += 1
-            # print(i, prev_index, adj_i_prev, overlap_i_prev, containment_i_prev, cur_row_index)
-            for j in sorted_indices_start_y:
-                overlap_i_j, containment_i_j = get_y_overlap_and_containment(
-                    coordinates[i], coordinates[j])
-                adj_i_j = max(adj[i, j], adj[j, i])
-                if adj_i_j == 1 and (overlap_i_j >= 0.1
-                                     or containment_i_j >= 0.3):
-                    row_indexes[j].append(cur_row_index)
-                elif adj_i_j == 0 and (overlap_i_j >= 0.15
-                                       or containment_i_j >= 0.5):
-                    row_indexes[j].append(cur_row_index)
-        prev_index = i
+        #include cell itself in it's overlaps
+        x1, y1, x2, y2 = coordinates[i]
+        y_overlapping_cells = set([j.data for j in y_interval_tree[y1:y2]])
+        condition_meeting_overlapping_cells = []
+        for j in y_overlapping_cells:
+            overlap_i_j, containment_i_j = get_y_overlap_and_containment(
+                coordinates[i], coordinates[j])
+            adj_i_j = max(adj[i, j], adj[j, i])
+            if adj_i_j == 1 and (overlap_i_j >= 0.5
+                                 or containment_i_j >= 0.75):
+                condition_meeting_overlapping_cells.append(j)
+
+            elif adj_i_j == 0 and (overlap_i_j >= 0.7
+                                   or containment_i_j >= 0.85):
+                condition_meeting_overlapping_cells.append(j)
+        row_indexes_np = np.array(row_indexes)
+
+        if len(row_indexes[i]) > 2:
+            continue
+        num_common_assigned_indices = len(
+            set.intersection(
+                *row_indexes_np[condition_meeting_overlapping_cells]))
+        # print(i, y_overlapping_cells, condition_meeting_overlapping_cells,
+        #       num_common_assigned_indices)
+        if num_common_assigned_indices > 0:
+            continue
+        cur_row_index += 1
+        # print(cur_row_index)
+        for j in condition_meeting_overlapping_cells:
+            row_indexes[j].add(cur_row_index)
+
+    # print(row_indexes)
     start_row_indices = []
     end_row_indices = []
     skipped = []
@@ -313,7 +442,7 @@ def create_cell_annotation(root,
                            table_details,
                            table_information,
                            img,
-                           add_content=True):
+                           add_content=False):
     obj = ET.SubElement(root, "object")
     ET.SubElement(obj, "name").text = "table"
     ET.SubElement(obj, "pose").text = "Unspecified"
@@ -351,17 +480,34 @@ def create_cell_annotation(root,
 
 ######################################################
 def main():
+    index = 0
     for text_file in os.listdir(text_read_path):
         if text_file.endswith('txt'):
+            removed_indices = []
             file_prefix = text_file.replace(".txt", "")
-            # if file_prefix != 'failure_1_1806.04265v1.5':
+            # if file_prefix != '0710.1481v1.1':
             #     continue
             img_read_path = image_read_path + file_prefix + ".png"
             img_write_path = image_write_path + file_prefix + ".jpg"
             read_text_path = text_read_path + text_file
             table_cells, skipped_indices = read_text_file(read_text_path)
             removed_indices = recursively_remove_overlaps(
-                table_cells, overlapping_area_pct_threshold=0.2)
+                table_cells,
+                overlapping_area_pct_threshold=0.25,
+                removed_indices=removed_indices)
+            print("Cells removed due to overlap : " + str(removed_indices))
+            removed_indices = recursively_remove_columnwise_unaligned_cells(
+                table_cells,
+                containment_region_pct_threshold=0.7,
+                removed_indices=removed_indices)
+            print("Cells removed due to column-wise misalignment : " +
+                  str(removed_indices))
+            removed_indices = recursively_remove_rowwise_unaligned_cells(
+                table_cells,
+                containment_region_pct_threshold=0.7,
+                removed_indices=removed_indices)
+            print("After removing cells due to row-wise misalignment : " +
+                  str(removed_indices))
             row_adj = pickle.load(
                 open(row_pkl_read_path + file_prefix + ".pkl", 'rb'))
             col_adj = pickle.load(
@@ -412,14 +558,19 @@ def main():
                 #     str(end_row_assignments[i]) + "\t" +
                 #     str(start_col_assignments[i]) + "\t" +
                 #     str(end_col_assignments[i]))
-            root = create_cell_annotation(root, table_details,
-                                          table_information, img)
+            root = create_cell_annotation(root,
+                                          table_details,
+                                          table_information,
+                                          img,
+                                          add_content=False)
             tree = ET.ElementTree(root)
             xml_file_path = xml_output_path + file_prefix + ".xml"
             tree.write(xml_file_path)
             img = add_cells_to_img(img, table_cells, skipped_indices)
             cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             cv2.imwrite(img_write_path, img)
+            index += 1
+            print("Processed Files : " + str(index))
 
 
 if __name__ == "__main__":
