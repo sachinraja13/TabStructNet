@@ -87,12 +87,14 @@ for dir_item in dir_list:
             img_fname = img_file
             if '.TIFF' in img_fname:
                 img_fname = img_fname.replace('.TIFF', '.jpg')
-            if '.tiff' in img_fname:
+            elif '.tiff' in img_fname:
                 img_fname = img_fname.replace('.tiff', '.jpg')
-            if '.JPG' in img_fname:
+            elif '.JPG' in img_fname:
                 img_fname = img_fname.replace('.JPG', '.jpg')
-            if '.png' in img_fname:
+            elif '.png' in img_fname:
                 img_fname = img_fname.replace('.png', '.jpg')
+            else:
+                continue
             read_img_path = dir_item + img_file
             print(read_img_path)
             out_img_path = output_images_dir + dir_item[:-1] + '_' + str(
